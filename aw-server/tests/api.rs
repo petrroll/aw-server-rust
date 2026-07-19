@@ -29,6 +29,30 @@ mod api_tests {
     }
 
     #[test]
+    fn test_info_advertises_rule_engine_capabilities() {
+        let server = setup_testserver();
+        let client = Client::untracked(server).expect("valid instance");
+        let response = client
+            .get("/api/0/info")
+            .header(Header::new("Host", "127.0.0.1:5600"))
+            .dispatch();
+
+        assert_eq!(response.status(), Status::Ok);
+        let info: Value = serde_json::from_str(&response.into_string().unwrap()).unwrap();
+        assert_eq!(
+            info["capabilities"],
+            json!([
+                "query.categorize_v2.v1",
+                "query.categorize_v2_explain.v1",
+                "query.active_periods_v2.v1",
+                "query.merge_subwatcher_fields.source_namespace.v1",
+                "query.map_event_fields.v1",
+                "query.query_bucket_optional.expected_hostname.v1"
+            ])
+        );
+    }
+
+    #[test]
     fn test_bucket() {
         let server = setup_testserver();
         let client = Client::untracked(server).expect("valid instance");
@@ -554,8 +578,11 @@ mod api_tests {
             }"#,
             )
             .dispatch();
-        assert_eq!(res.status(), rocket::http::Status::InternalServerError);
-        assert_eq!(res.into_string().unwrap(), r#"{"message":"EmptyQuery"}"#);
+        assert_eq!(res.status(), rocket::http::Status::BadRequest);
+        assert_eq!(
+            res.into_string().unwrap(),
+            r#"{"type":"QueryInterpretException","message":"EmptyQuery"}"#
+        );
     }
 
     fn set_setting_request(client: &Client, key: &str, value: &Value) -> Status {

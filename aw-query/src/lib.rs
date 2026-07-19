@@ -29,6 +29,7 @@ pub use crate::interpret::VarEnv;
 // (works during lexing, but not during parsing I believe)
 
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum QueryError {
     // Parser
     ParsingError(String),
@@ -41,7 +42,29 @@ pub enum QueryError {
     InvalidFunctionParameters(String),
     TimeIntervalError(String),
     BucketQueryError(String),
+    DatastoreQueryError(String),
     RegexCompileError(String),
+}
+
+impl QueryError {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            QueryError::ParsingError(_) => "QueryParseException",
+            QueryError::EmptyQuery() => "QueryInterpretException",
+            QueryError::VariableNotDefined(_) => "QueryInterpretException",
+            QueryError::MathError(_) => "QueryInterpretException",
+            QueryError::InvalidType(_) => "QueryInterpretException",
+            QueryError::InvalidFunctionParameters(_) => "QueryFunctionException",
+            QueryError::TimeIntervalError(_) => "QueryFunctionException",
+            QueryError::BucketQueryError(_) => "QueryFunctionException",
+            QueryError::DatastoreQueryError(_) => "InternalServerError",
+            QueryError::RegexCompileError(_) => "QueryFunctionException",
+        }
+    }
+
+    pub fn is_server_error(&self) -> bool {
+        matches!(self, QueryError::DatastoreQueryError(_))
+    }
 }
 
 impl fmt::Display for QueryError {

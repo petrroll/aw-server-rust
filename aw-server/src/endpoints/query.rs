@@ -17,8 +17,13 @@ pub fn query(query_req: Json<Query>, state: &State<ServerState>) -> Result<Value
             Ok(data) => data,
             Err(e) => {
                 warn!("Query failed: {:?}", e);
-                return Err(HttpErrorJson::new(
-                    Status::InternalServerError,
+                return Err(HttpErrorJson::new_typed(
+                    if e.is_server_error() {
+                        Status::InternalServerError
+                    } else {
+                        Status::BadRequest
+                    },
+                    e.kind().to_string(),
                     e.to_string(),
                 ));
             }

@@ -253,9 +253,17 @@ parser! {
             span: span!(),
             node: Expr_::Bool(b),
         },
+        Null => Expr {
+            span: span!(),
+            node: Expr_::Null,
+        },
         Number(i) => Expr {
             span: span!(),
             node: Expr_::Number(i),
+        },
+        Minus Number(i) => Expr {
+            span: span!(),
+            node: Expr_::Number(-i),
         },
         String(s) => Expr {
             span: span!(),

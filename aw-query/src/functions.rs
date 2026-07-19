@@ -16,6 +16,13 @@ pub fn fill_env(env: &mut VarEnv) {
         DataType::Function("query_bucket".to_string(), qfunctions::query_bucket),
     );
     env.insert(
+        "query_bucket_optional".to_string(),
+        DataType::Function(
+            "query_bucket_optional".to_string(),
+            qfunctions::query_bucket_optional,
+        ),
+    );
+    env.insert(
         "query_bucket_names".to_string(),
         DataType::Function(
             "query_bucket_names".to_string(),
@@ -61,6 +68,17 @@ pub fn fill_env(env: &mut VarEnv) {
         ),
     );
     env.insert(
+        "merge_subwatcher_fields".to_string(),
+        DataType::Function(
+            "merge_subwatcher_fields".to_string(),
+            qfunctions::merge_subwatcher_fields,
+        ),
+    );
+    env.insert(
+        "map_event_fields".to_string(),
+        DataType::Function("map_event_fields".into(), qfunctions::map_event_fields),
+    );
+    env.insert(
         "chunk_events_by_key".to_string(),
         DataType::Function(
             "chunk_events_by_key".to_string(),
@@ -102,6 +120,21 @@ pub fn fill_env(env: &mut VarEnv) {
         DataType::Function("categorize".into(), qfunctions::categorize),
     );
     env.insert(
+        "categorize_v2".to_string(),
+        DataType::Function("categorize_v2".into(), qfunctions::categorize_v2),
+    );
+    env.insert(
+        "categorize_v2_explain".to_string(),
+        DataType::Function(
+            "categorize_v2_explain".into(),
+            qfunctions::categorize_v2_explain,
+        ),
+    );
+    env.insert(
+        "active_periods_v2".to_string(),
+        DataType::Function("active_periods_v2".into(), qfunctions::active_periods_v2),
+    );
+    env.insert(
         "tag".to_string(),
         DataType::Function("tag".into(), qfunctions::tag),
     );
@@ -116,7 +149,7 @@ pub fn fill_env(env: &mut VarEnv) {
 }
 
 mod qfunctions {
-    use aw_datastore::Datastore;
+    use aw_datastore::{Datastore, DatastoreError};
     use aw_models::Event;
     use aw_transform::classify::Rule;
 
@@ -154,9 +187,14 @@ mod qfunctions {
             None,
         ) {
             Ok(events) => events,
-            Err(e) => {
+            Err(DatastoreError::NoSuchBucket(error)) => {
                 return Err(QueryError::BucketQueryError(format!(
-                    "Failed to query bucket: {e:?}"
+                    "Failed to query bucket: {error}"
+                )))
+            }
+            Err(error) => {
+                return Err(QueryError::DatastoreQueryError(format!(
+                    "Failed to query bucket: {error:?}"
                 )))
             }
         };
@@ -165,6 +203,51 @@ mod qfunctions {
             ret.push(DataType::Event(event));
         }
         Ok(DataType::List(ret))
+    }
+
+    pub fn query_bucket_optional(
+        mut args: Vec<DataType>,
+        env: &VarEnv,
+        ds: &Datastore,
+    ) -> Result<DataType, QueryError> {
+        validate::args_length(&args, if args.len() == 2 { 2 } else { 1 })?;
+        let expected_hostname = if args.len() == 2 {
+            Some(String::try_from(args.pop().unwrap())?)
+        } else {
+            None
+        };
+        let bucket_id: String = args.pop().unwrap().try_into()?;
+        if let Some(expected_hostname) = expected_hostname {
+            match ds.get_bucket(bucket_id.as_str()) {
+                Ok(bucket) if bucket.hostname == expected_hostname => {}
+                Ok(_) | Err(DatastoreError::NoSuchBucket(_)) => {
+                    return Ok(DataType::List(Vec::new()))
+                }
+                Err(error) => {
+                    return Err(QueryError::DatastoreQueryError(format!(
+                        "Failed to inspect bucket: {error:?}"
+                    )))
+                }
+            }
+        }
+        let interval = validate::get_timeinterval(env)?;
+        let events = match ds.get_events(
+            bucket_id.as_str(),
+            Some(*interval.start()),
+            Some(*interval.end()),
+            None,
+        ) {
+            Ok(events) => events,
+            Err(DatastoreError::NoSuchBucket(_)) => Vec::new(),
+            Err(error) => {
+                return Err(QueryError::DatastoreQueryError(format!(
+                    "Failed to query bucket: {error:?}"
+                )))
+            }
+        };
+        Ok(DataType::List(
+            events.into_iter().map(DataType::Event).collect(),
+        ))
     }
 
     pub fn query_bucket_names(
@@ -177,7 +260,7 @@ mod qfunctions {
         let buckets = match ds.get_buckets() {
             Ok(buckets) => buckets,
             Err(e) => {
-                return Err(QueryError::BucketQueryError(format!(
+                return Err(QueryError::DatastoreQueryError(format!(
                     "Failed to query bucket names: {e:?}"
                 )))
             }
@@ -205,7 +288,7 @@ mod qfunctions {
         let buckets = match ds.get_buckets() {
             Ok(buckets) => buckets,
             Err(e) => {
-                return Err(QueryError::BucketQueryError(format!(
+                return Err(QueryError::DatastoreQueryError(format!(
                     "Failed to query bucket names: {e:?}"
                 )))
             }
@@ -296,6 +379,47 @@ mod qfunctions {
         Ok(DataType::List(tagged_flooded_events))
     }
 
+    pub fn categorize_v2(
+        args: Vec<DataType>,
+        _env: &VarEnv,
+        _ds: &Datastore,
+    ) -> Result<DataType, QueryError> {
+        validate::args_length(&args, 2).or_else(|_| validate::args_length(&args, 3))?;
+        let mut args = args.into_iter();
+        let events: Vec<Event> = args.next().unwrap().try_into()?;
+        let category_specs: serde_json::Value = args.next().unwrap().try_into()?;
+        let host: Option<String> = match args.next() {
+            Some(DataType::None()) | None => None,
+            Some(host) => Some(host.try_into()?),
+        };
+        let events = aw_transform::categorize_v2_for_host(events, &category_specs, host.as_deref())
+            .map_err(QueryError::InvalidFunctionParameters)?;
+        Ok(DataType::List(
+            events.into_iter().map(DataType::Event).collect(),
+        ))
+    }
+
+    pub fn categorize_v2_explain(
+        args: Vec<DataType>,
+        _env: &VarEnv,
+        _ds: &Datastore,
+    ) -> Result<DataType, QueryError> {
+        validate::args_length(&args, 2).or_else(|_| validate::args_length(&args, 3))?;
+        let mut args = args.into_iter();
+        let events: Vec<Event> = args.next().unwrap().try_into()?;
+        let category_specs: serde_json::Value = args.next().unwrap().try_into()?;
+        let host: Option<String> = match args.next() {
+            Some(DataType::None()) | None => None,
+            Some(host) => Some(host.try_into()?),
+        };
+        let events =
+            aw_transform::categorize_v2_explain_for_host(events, &category_specs, host.as_deref())
+                .map_err(QueryError::InvalidFunctionParameters)?;
+        Ok(DataType::List(
+            events.into_iter().map(DataType::Event).collect(),
+        ))
+    }
+
     pub fn tag(
         args: Vec<DataType>,
         _env: &VarEnv,
@@ -332,6 +456,7 @@ mod qfunctions {
         for event in sorted_events.drain(..) {
             tagged_sorted_events.push(DataType::Event(event));
         }
+
         Ok(DataType::List(tagged_sorted_events))
     }
 
@@ -411,6 +536,106 @@ mod qfunctions {
             merged_tagged_events.push(DataType::Event(event));
         }
         Ok(DataType::List(merged_tagged_events))
+    }
+
+    pub fn merge_subwatcher_fields(
+        args: Vec<DataType>,
+        _env: &VarEnv,
+        _ds: &Datastore,
+    ) -> Result<DataType, QueryError> {
+        if !(3..=5).contains(&args.len()) {
+            return Err(QueryError::InvalidFunctionParameters(format!(
+                "Expected 3 to 5 parameters in function, got {}",
+                args.len()
+            )));
+        }
+        let mut args = args.into_iter();
+        let base_events: Vec<Event> = args.next().unwrap().try_into()?;
+        let subwatcher_events: Vec<Event> = args.next().unwrap().try_into()?;
+        let keys: Vec<String> = args.next().unwrap().try_into()?;
+        let mut conflict = "base_wins".to_string();
+        let mut source_id = None;
+        let mut source_id_from_options = false;
+
+        if let Some(options) = args.next() {
+            match options {
+                DataType::String(value) => conflict = value,
+                DataType::Dict(options) => {
+                    if let Some(value) = options.get("conflict") {
+                        conflict = match value {
+                            DataType::String(value) => value.clone(),
+                            invalid => {
+                                return Err(QueryError::InvalidFunctionParameters(format!(
+                                    "conflict must be 'base_wins' or 'sub_wins', got {invalid:?}"
+                                )))
+                            }
+                        };
+                    }
+                    if let Some(value) = options.get("source_id") {
+                        source_id_from_options = true;
+                        source_id = match value {
+                            DataType::String(value) => Some(value.clone()),
+                            DataType::None() => None,
+                            invalid => {
+                                return Err(QueryError::InvalidFunctionParameters(format!(
+                                    "source_id must be a string, got {invalid:?}"
+                                )))
+                            }
+                        };
+                    }
+                }
+                invalid => {
+                    return Err(QueryError::InvalidFunctionParameters(format!(
+                        "merge_subwatcher_fields fourth argument must be a conflict string or options dict, got {invalid:?}"
+                    )))
+                }
+            }
+        }
+        if let Some(value) = args.next() {
+            if source_id_from_options {
+                return Err(QueryError::InvalidFunctionParameters(
+                    "source_id must be provided either in options or as the fifth argument, not both"
+                        .to_string(),
+                ));
+            }
+            source_id = match value {
+                DataType::String(value) => Some(value),
+                DataType::None() => None,
+                invalid => {
+                    return Err(QueryError::InvalidFunctionParameters(format!(
+                        "source_id must be a string, got {invalid:?}"
+                    )))
+                }
+            };
+        }
+
+        let events = aw_transform::merge_subwatcher_fields(
+            base_events,
+            subwatcher_events,
+            &keys,
+            &conflict,
+            source_id.as_deref(),
+        )
+        .map_err(QueryError::InvalidFunctionParameters)?;
+        Ok(DataType::List(
+            events.into_iter().map(DataType::Event).collect(),
+        ))
+    }
+
+    pub fn map_event_fields(
+        args: Vec<DataType>,
+        _env: &VarEnv,
+        _ds: &Datastore,
+    ) -> Result<DataType, QueryError> {
+        validate::args_length(&args, 2)?;
+        let mut args = args.into_iter();
+        let events: Vec<Event> = args.next().unwrap().try_into()?;
+        let mappings: serde_json::Value = args.next().unwrap().try_into()?;
+        let events = aw_transform::map_event_fields(events, &mappings)
+            .map_err(QueryError::InvalidFunctionParameters)?;
+        Ok(DataType::List(
+            events.into_iter().map(DataType::Event).collect(),
+        ))
     }
 
     pub fn chunk_events_by_key(
@@ -519,6 +744,41 @@ mod qfunctions {
             filtered_tagged_events.push(DataType::Event(event));
         }
         Ok(DataType::List(filtered_tagged_events))
+    }
+
+    pub fn active_periods_v2(
+        args: Vec<DataType>,
+        _env: &VarEnv,
+        _ds: &Datastore,
+    ) -> Result<DataType, QueryError> {
+        validate::args_length(&args, 2).or_else(|_| validate::args_length(&args, 3))?;
+        let mut args = args.into_iter();
+        let named_sources: Vec<DataType> = args.next().unwrap().try_into()?;
+        let mut sources = Vec::with_capacity(named_sources.len());
+        for source in named_sources {
+            let pair: Vec<DataType> = source.try_into()?;
+            if pair.len() != 2 {
+                return Err(QueryError::InvalidFunctionParameters(
+                    "active_periods_v2 named sources must be [source_id, event_list] pairs"
+                        .to_string(),
+                ));
+            }
+            let mut pair = pair.into_iter();
+            let source_id: String = pair.next().unwrap().try_into()?;
+            let events: Vec<Event> = pair.next().unwrap().try_into()?;
+            sources.push((source_id, events));
+        }
+        let expression: serde_json::Value = args.next().unwrap().try_into()?;
+        let host: Option<String> = match args.next() {
+            Some(DataType::None()) | None => None,
+            Some(host) => Some(host.try_into()?),
+        };
+        let result =
+            aw_transform::active_periods_v2_for_host(sources, &expression, host.as_deref())
+                .map_err(QueryError::InvalidFunctionParameters)?;
+        Ok(DataType::List(
+            result.into_iter().map(DataType::Event).collect(),
+        ))
     }
 
     pub fn split_url_events(

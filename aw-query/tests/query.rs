@@ -112,9 +112,9 @@ mod query_tests {
         let ds = setup_datastore_empty();
         let interval = TimeInterval::new_from_string(TIME_INTERVAL).unwrap();
 
-        let code = String::from("1;1.;return 1.1;");
+        let code = String::from("1;1.0;return -1.5e2;");
         match aw_query::query(&code, &interval, &ds).unwrap() {
-            aw_query::DataType::Number(n) => assert_eq!(n, 1.1),
+            aw_query::DataType::Number(n) => assert_eq!(n, -150.0),
             ref data => panic!("Wrong datatype, {data:?}"),
         };
     }
@@ -349,7 +349,12 @@ mod query_tests {
             events = limit_events(events, 10000);
             events = sort_by_timestamp(events);
             events = concat(events, query_bucket("{}"));
+            events = concat(events, query_bucket_optional("missing"));
+            events = merge_subwatcher_fields(events, events, ["key"], {{ "source_id": "self" }});
+            events = map_event_fields(events, {{ "title": "key" }});
             events = categorize(events, [[["test"], {{ "type": "regex", "regex": "value$" }}], [["test", "testing"], {{ "type": "regex", "regex": "value$" }}]]);
+            events = categorize_v2(events, [{{ "name": ["test"], "rule": {{ "type": "regex", "host": "testhost", "field": "key", "regex": "value$" }} }}], "testhost");
+            events = categorize_v2_explain(events, [{{ "name": ["test"], "data": {{ "color": null }}, "rule": {{ "type": "regex", "host": "testhost", "field": "key", "regex": "value$" }} }}], "testhost");
             events = tag(events, [["testtag", {{ "type": "regex", "regex": "test$" }}], ["another testtag", {{ "type": "regex", "regex": "test-pat$" }}]]);
             total_duration = sum_durations(events);
             bucketnames = query_bucket_names();
@@ -371,6 +376,40 @@ mod query_tests {
     }
 
     #[test]
+    fn test_query_bucket_optional_only_suppresses_missing_buckets() {
+        let ds = setup_datastore_populated();
+        let interval = TimeInterval::new_from_string(TIME_INTERVAL).unwrap();
+
+        let optional = aw_query::query(
+            r#"return query_bucket_optional("missing");"#,
+            &interval,
+            &ds,
+        )
+        .unwrap();
+        assert!(Vec::<Event>::try_from(&optional).unwrap().is_empty());
+        let existing =
+            aw_query::query(r#"return query_bucket_optional("testid");"#, &interval, &ds).unwrap();
+        assert!(!Vec::<Event>::try_from(&existing).unwrap().is_empty());
+        let correct_host = aw_query::query(
+            r#"return query_bucket_optional("testid", "testhost");"#,
+            &interval,
+            &ds,
+        )
+        .unwrap();
+        assert!(!Vec::<Event>::try_from(&correct_host).unwrap().is_empty());
+        let wrong_host = aw_query::query(
+            r#"return query_bucket_optional("testid", "another-host");"#,
+            &interval,
+            &ds,
+        )
+        .unwrap();
+        assert!(Vec::<Event>::try_from(&wrong_host).unwrap().is_empty());
+
+        let strict = aw_query::query(r#"return query_bucket("missing");"#, &interval, &ds);
+        assert!(matches!(strict, Err(QueryError::BucketQueryError(_))));
+    }
+
+    #[test]
     fn test_categorize() {
         let ds = setup_datastore_populated();
         let interval = TimeInterval::new_from_string(TIME_INTERVAL).unwrap();
@@ -388,6 +427,240 @@ mod query_tests {
         let event = events.first().unwrap();
         let cats = event.data.get("$category").unwrap();
         assert_eq!(cats, &serde_json::json!(vec!["Test", "Subtest"]));
+    }
+
+    #[test]
+    fn test_merge_subwatcher_fields_and_categorize_v2() {
+        let ds = setup_datastore_with_bucket();
+        let interval = TimeInterval::new_from_string(TIME_INTERVAL).unwrap();
+        let event = Event {
+            id: None,
+            timestamp: chrono::Utc::now(),
+            duration: Duration::seconds(10),
+            data: json_map! {"key": json!("value")},
+        };
+        ds.insert_events(BUCKET_ID, &[event]).unwrap();
+        let code = format!(
+            r#"
+            events = query_bucket("{}");
+            context = query_bucket("{}");
+            events = merge_subwatcher_fields(events, context, ["key"], {{ "source_id": "context" }});
+            events = categorize_v2(events, [
+                {{
+                    "id": "base",
+                    "name": ["Base"],
+                    "rule": {{ "type": "regex", "field": "key", "regex": "^value$" }}
+                }},
+                {{
+                    "id": "context",
+                    "name": ["Context"],
+                    "rule": {{
+                        "type": "all",
+                        "rules": [
+                            {{ "type": "regex", "field": "key", "regex": "^value$" }},
+                            {{ "type": "regex", "source": "context", "field": "key", "regex": "^value$", "weight": 10 }}
+                        ]
+                    }}
+                }}
+            ]);
+            return events;"#,
+            BUCKET_ID, BUCKET_ID
+        );
+
+        let result = aw_query::query(&code, &interval, &ds).unwrap();
+        let events: Vec<Event> = Vec::try_from(&result).unwrap();
+        assert!(!events.is_empty());
+        assert_eq!(events[0].data["$source.context.key"], json!("value"));
+        assert_eq!(events[0].data["$category"], json!(["Context"]));
+        assert_eq!(events[0].data["$category_score"], json!(10));
+        assert_eq!(events[0].data["$category_rule"], json!("context"));
+    }
+
+    #[test]
+    fn test_context_app_and_title_do_not_replace_canonical_fields() {
+        let ds = setup_datastore_empty();
+        let now = chrono::Utc::now();
+        for bucket_id in ["base", "editor"] {
+            ds.create_bucket(&Bucket {
+                bid: None,
+                id: bucket_id.to_string(),
+                _type: "testtype".to_string(),
+                client: "testclient".to_string(),
+                hostname: "testhost".to_string(),
+                created: Some(now),
+                data: json_map! {},
+                metadata: BucketMetadata::default(),
+                events: None,
+                last_updated: None,
+            })
+            .unwrap();
+        }
+        ds.insert_events(
+            "base",
+            &[Event {
+                id: None,
+                timestamp: now,
+                duration: Duration::seconds(10),
+                data: json_map! {"app": json!("terminal"), "title": json!("shell")},
+            }],
+        )
+        .unwrap();
+        ds.insert_events(
+            "editor",
+            &[Event {
+                id: None,
+                timestamp: now,
+                duration: Duration::seconds(10),
+                data: json_map! {"app": json!("code"), "title": json!("project")},
+            }],
+        )
+        .unwrap();
+
+        let code = r#"
+            events = query_bucket("base");
+            context = query_bucket("editor");
+            events = merge_subwatcher_fields(
+                events,
+                context,
+                ["app", "title"],
+                {"source_id": "editor"}
+            );
+            return categorize_v2(events, [
+                {
+                    "id": "canonical",
+                    "name": ["Canonical"],
+                    "rule": {"type": "regex", "field": "app", "regex": "^code$"}
+                },
+                {
+                    "id": "context",
+                    "name": ["Context"],
+                    "rule": {
+                        "type": "regex",
+                        "source": "editor",
+                        "field": "app",
+                        "regex": "^code$"
+                    }
+                }
+            ]);"#;
+
+        let result = aw_query::query(
+            code,
+            &TimeInterval::new_from_string(TIME_INTERVAL).unwrap(),
+            &ds,
+        )
+        .unwrap();
+        let events = Vec::<Event>::try_from(&result).unwrap();
+        assert_eq!(events[0].data["app"], json!("terminal"));
+        assert_eq!(events[0].data["title"], json!("shell"));
+        assert_eq!(events[0].data["$source.editor.app"], json!("code"));
+        assert_eq!(events[0].data["$source.editor.title"], json!("project"));
+        assert_eq!(events[0].data["$category"], json!(["Context"]));
+    }
+
+    #[test]
+    fn test_active_periods_v2_named_sources_and_negative_predicate() {
+        let ds = setup_datastore_with_bucket();
+        let interval = TimeInterval::new_from_string(TIME_INTERVAL).unwrap();
+        let event = Event {
+            id: None,
+            timestamp: chrono::Utc::now(),
+            duration: Duration::seconds(10),
+            data: json_map! {"state": json!("active")},
+        };
+        ds.insert_events(BUCKET_ID, &[event]).unwrap();
+        let code = format!(
+            r#"
+            afk = query_bucket("{}");
+            sources = [["afk", afk]];
+            return active_periods_v2(sources, {{
+                "source": "afk",
+                "host": "testhost",
+                "field": "state",
+                "regex": "^idle$",
+                "negate": true,
+                "weight": 1.0
+            }}, "testhost");"#,
+            BUCKET_ID
+        );
+
+        let result = aw_query::query(&code, &interval, &ds).unwrap();
+        let events: Vec<Event> = Vec::try_from(&result).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].data["state"], json!("active"));
+    }
+
+    #[test]
+    fn test_active_periods_v2_validation_errors() {
+        let ds = setup_datastore_empty();
+        let interval = TimeInterval::new_from_string(TIME_INTERVAL).unwrap();
+
+        let missing_source =
+            r#"return active_periods_v2([], {"type": "regex", "regex": "active"});"#;
+        let error = aw_query::query(missing_source, &interval, &ds).unwrap_err();
+        assert!(format!("{error}").contains("'source'"));
+
+        let unknown_source = r#"
+            return active_periods_v2(
+                [["afk", []]],
+                {"type": "regex", "source": "window", "regex": "active"}
+            );"#;
+        let error = aw_query::query(unknown_source, &interval, &ds).unwrap_err();
+        assert!(format!("{error}").contains("unknown source"));
+
+        let duplicate_source = r#"
+            return active_periods_v2(
+                [["afk", []], ["afk", []]],
+                {"type": "none"}
+            );"#;
+        let error = aw_query::query(duplicate_source, &interval, &ds).unwrap_err();
+        assert!(format!("{error}").contains("duplicate"));
+    }
+
+    #[test]
+    fn test_v2_function_validation_errors() {
+        let ds = setup_datastore_empty();
+        let interval = TimeInterval::new_from_string(TIME_INTERVAL).unwrap();
+
+        let invalid_conflict = r#"return merge_subwatcher_fields([], [], [], "invalid");"#;
+        let error = aw_query::query(invalid_conflict, &interval, &ds).unwrap_err();
+        assert!(format!("{error}").contains("conflict must be"));
+
+        let invalid_source =
+            r#"return merge_subwatcher_fields([], [], [], {"source_id": "invalid.source"});"#;
+        let error = aw_query::query(invalid_source, &interval, &ds).unwrap_err();
+        assert!(format!("{error}").contains("source_id"));
+
+        let duplicate_source = r#"return merge_subwatcher_fields(
+            [], [], [], {"source_id": "options"}, "positional"
+        );"#;
+        let error = aw_query::query(duplicate_source, &interval, &ds).unwrap_err();
+        assert!(format!("{error}").contains("not both"));
+
+        let invalid_priority = r#"return categorize_v2([], [{"name": ["Bad"], "priority": 1.5}]);"#;
+        let error = aw_query::query(invalid_priority, &interval, &ds).unwrap_err();
+        assert!(format!("{error}").contains("'priority' must be an integer"));
+
+        let cycle = r#"
+            return categorize_v2([], [
+                {"id": "a", "name": ["A"], "requires": ["b"]},
+                {"id": "b", "name": ["B"], "requires": ["a"]}
+            ]);"#;
+        let error = aw_query::query(cycle, &interval, &ds).unwrap_err();
+        assert!(format!("{error}").contains("dependency cycle"));
+    }
+
+    #[test]
+    fn test_v2_optional_hosts_accept_none() {
+        let ds = setup_datastore_empty();
+        let interval = TimeInterval::new_from_string(TIME_INTERVAL).unwrap();
+        let code = r#"
+            categorized = categorize_v2([], [], None);
+            explained = categorize_v2_explain([], [], None);
+            active = active_periods_v2([], {"type": "none"}, None);
+            return concat(categorized, concat(explained, active));"#;
+
+        let result = aw_query::query(code, &interval, &ds).unwrap();
+        assert!(Vec::<Event>::try_from(&result).unwrap().is_empty());
     }
 
     #[test]
@@ -557,6 +830,24 @@ mod query_tests {
         let code = String::from("return \"test \\\" with escaped quote\";");
         match aw_query::query(&code, &interval, &ds).unwrap() {
             aw_query::DataType::String(s) => assert_eq!(s, "test \" with escaped quote"),
+            _ => panic!("Wrong datatype"),
+        }
+
+        let code = String::from(r#"return "path\\";"#);
+        match aw_query::query(&code, &interval, &ds).unwrap() {
+            aw_query::DataType::String(s) => assert_eq!(s, r"path\\"),
+            _ => panic!("Wrong datatype"),
+        }
+
+        let code = String::from(r#"return "\w+";"#);
+        match aw_query::query(&code, &interval, &ds).unwrap() {
+            aw_query::DataType::String(s) => assert_eq!(s, r"\w+"),
+            _ => panic!("Wrong datatype"),
+        }
+
+        let code = String::from(r#"return "a\\\"b";"#);
+        match aw_query::query(&code, &interval, &ds).unwrap() {
+            aw_query::DataType::String(s) => assert_eq!(s, "a\\\"b"),
             _ => panic!("Wrong datatype"),
         }
     }

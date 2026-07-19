@@ -30,6 +30,7 @@ pub use self::bucket::BucketMetadata;
 pub use self::bucket::BucketsExport;
 pub use self::event::Event;
 pub use self::info::Info;
+pub use self::info::InfoWithCapabilities;
 pub use self::query::Query;
 pub use self::settings::Settings;
 pub use self::settings::{

@@ -13,6 +13,8 @@ use aw_models::BucketsExport;
 pub struct HttpErrorJson {
     #[serde(skip_serializing)]
     status: Status,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    error_type: Option<String>,
     message: String,
 }
 
@@ -20,6 +22,15 @@ impl HttpErrorJson {
     pub fn new(status: Status, err: String) -> HttpErrorJson {
         HttpErrorJson {
             status,
+            error_type: None,
+            message: err,
+        }
+    }
+
+    pub fn new_typed(status: Status, error_type: String, err: String) -> HttpErrorJson {
+        HttpErrorJson {
+            status,
+            error_type: Some(error_type),
             message: err,
         }
     }

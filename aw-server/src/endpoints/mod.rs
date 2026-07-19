@@ -11,7 +11,7 @@ use rocket::State;
 use crate::config::AWConfig;
 
 use aw_datastore::Datastore;
-use aw_models::Info;
+use aw_models::{Info, InfoWithCapabilities};
 
 #[derive(RustEmbed)]
 #[folder = "$AW_WEBUI_DIR"]
@@ -106,16 +106,26 @@ fn root_manifest(state: &State<ServerState>) -> Option<(ContentType, Vec<u8>)> {
 }
 
 #[get("/")]
-fn server_info(config: &State<AWConfig>, state: &State<ServerState>) -> Json<Info> {
+fn server_info(config: &State<AWConfig>, state: &State<ServerState>) -> Json<InfoWithCapabilities> {
     #[allow(clippy::or_fun_call)]
     let hostname = gethostname().into_string().unwrap_or("unknown".to_string());
     const VERSION: Option<&'static str> = option_env!("CARGO_PKG_VERSION");
 
-    Json(Info {
-        hostname,
-        version: format!("v{} (rust)", VERSION.unwrap_or("(unknown)")),
-        testing: config.testing,
-        device_id: state.device_id.clone(),
+    Json(InfoWithCapabilities {
+        info: Info {
+            hostname,
+            version: format!("v{} (rust)", VERSION.unwrap_or("(unknown)")),
+            testing: config.testing,
+            device_id: state.device_id.clone(),
+        },
+        capabilities: vec![
+            "query.categorize_v2.v1".to_string(),
+            "query.categorize_v2_explain.v1".to_string(),
+            "query.active_periods_v2.v1".to_string(),
+            "query.merge_subwatcher_fields.source_namespace.v1".to_string(),
+            "query.map_event_fields.v1".to_string(),
+            "query.query_bucket_optional.expected_hostname.v1".to_string(),
+        ],
     })
 }
 

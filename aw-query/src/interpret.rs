@@ -192,6 +192,7 @@ fn interpret_expr(
             None => Err(QueryError::VariableNotDefined(var.to_string())),
         },
         Bool(lit) => Ok(DataType::Bool(lit)),
+        Null => Ok(DataType::None()),
         Number(lit) => Ok(DataType::Number(lit)),
         String(litstr) => Ok(DataType::String(litstr)),
         Return(e) => {

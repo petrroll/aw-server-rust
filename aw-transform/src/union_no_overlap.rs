@@ -165,4 +165,29 @@ mod tests {
         assert_eq!(events_union[1].timestamp, now + td1h);
         assert_eq!(events_union[1].duration, td1h);
     }
+
+    #[test]
+    fn test_union_no_overlap_preserves_first_stream_data_precedence() {
+        let now = Utc::now();
+        let high_priority = Event::new(
+            now + Duration::hours(1),
+            Duration::hours(2),
+            serde_json::Map::from_iter([("source".to_string(), serde_json::json!("high"))]),
+        );
+        let low_priority = Event::new(
+            now,
+            Duration::hours(4),
+            serde_json::Map::from_iter([("source".to_string(), serde_json::json!("low"))]),
+        );
+
+        let events = union_no_overlap(vec![high_priority], vec![low_priority]);
+
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].data["source"], serde_json::json!("low"));
+        assert_eq!(events[0].duration, Duration::hours(1));
+        assert_eq!(events[1].data["source"], serde_json::json!("high"));
+        assert_eq!(events[1].duration, Duration::hours(2));
+        assert_eq!(events[2].data["source"], serde_json::json!("low"));
+        assert_eq!(events[2].duration, Duration::hours(1));
+    }
 }

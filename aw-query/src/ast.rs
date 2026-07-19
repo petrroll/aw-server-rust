@@ -30,6 +30,7 @@ pub enum Expr_ {
     Return(Box<Expr>),
 
     Bool(bool),
+    Null,
     Number(f64),
     String(String),
     List(Vec<Expr>),

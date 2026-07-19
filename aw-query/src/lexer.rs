@@ -10,6 +10,7 @@ pub enum Token {
     Return,
 
     Bool(bool),
+    Null,
     Number(f64),
     String(String),
     Plus,
@@ -34,6 +35,41 @@ pub enum Token {
     Comment,
 }
 
+fn number_token(text: &str) -> Token {
+    match text.parse() {
+        Ok(number) => Token::Number(number),
+        Err(error) => panic!("Number {text} is out of range: {error}"),
+    }
+}
+
+fn string_token(text: &str) -> Token {
+    let value = &text[1..text.len() - 1];
+    let mut decoded = String::new();
+    let mut chars = value.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character != '\\' {
+            decoded.push(character);
+            continue;
+        }
+        let mut count = 1;
+        while chars.peek() == Some(&'\\') {
+            chars.next();
+            count += 1;
+        }
+        if chars.peek() == Some(&'"') && count % 2 == 1 {
+            for _ in 0..((count - 1) / 2) {
+                decoded.push('\\');
+            }
+            decoded.push(chars.next().unwrap());
+        } else {
+            for _ in 0..count {
+                decoded.push('\\');
+            }
+        }
+    }
+    Token::String(decoded)
+}
+
 lexer! {
     fn next_token(text: 'a) -> (Token, &'a str);
 
@@ -52,18 +88,18 @@ lexer! {
     // TODO: Deprecate/Remove?
     r#"True"# => (Token::Bool(true), text),
     r#"False"# => (Token::Bool(false), text),
+    r#"null"# => (Token::Null, text),
+    r#"None"# => (Token::Null, text),
 
-    r#"\"([^\"]|(\\\"))*\""# => (
-        Token::String(text.to_owned()[1..text.len()-1].replace("\\\"", "\"")),
-        text
-    ),
-    r#"[0-9]+[\.]?[0-9]*"# => {
-        let tok = match text.parse() {
-            Ok(n) => Token::Number(n),
-            Err(e) => panic!("Integer {text} is out of range: {e}"),
-        };
-        (tok, text)
-    }
+    r#"\"([^\"\\]|\\.)*\""# => (string_token(text), text),
+    r#"[0-9]+\.[0-9]+[eE]\+[0-9]+"# => (number_token(text), text),
+    r#"[0-9]+\.[0-9]+[eE]-[0-9]+"# => (number_token(text), text),
+    r#"[0-9]+\.[0-9]+[eE][0-9]+"# => (number_token(text), text),
+    r#"[0-9]+[eE]\+[0-9]+"# => (number_token(text), text),
+    r#"[0-9]+[eE]-[0-9]+"# => (number_token(text), text),
+    r#"[0-9]+[eE][0-9]+"# => (number_token(text), text),
+    r#"[0-9]+\.[0-9]+"# => (number_token(text), text),
+    r#"[0-9]+"# => (number_token(text), text),
 
     r#"[a-zA-Z_][a-zA-Z0-9_]*"# => (Token::Ident(text.to_owned()), text),
 

@@ -88,6 +88,7 @@ impl AwClient {
     proxy_method!(delete_event, (), bucketname: &str, event_id: i64);
     proxy_method!(get_event_count, i64, bucketname: &str);
     proxy_method!(get_info, aw_models::Info,);
+    proxy_method!(get_info_with_capabilities, aw_models::InfoWithCapabilities,);
     proxy_method!(get_setting, serde_json::Value, setting: &str);
     proxy_method!(get_settings, aw_models::Settings,);
 

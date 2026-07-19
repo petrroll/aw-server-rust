@@ -251,6 +251,13 @@ impl AwClient {
         Self::send_success(self.client.get(url)).await?.json().await
     }
 
+    pub async fn get_info_with_capabilities(
+        &self,
+    ) -> Result<aw_models::InfoWithCapabilities, reqwest::Error> {
+        let url = format!("{}api/0/info", self.baseurl);
+        Self::send_success(self.client.get(url)).await?.json().await
+    }
+
     pub async fn get_setting(&self, setting: &str) -> Result<serde_json::Value, reqwest::Error> {
         let url = format!("{}api/0/settings/{}", self.baseurl, setting);
         Self::send_success(self.client.get(url)).await?.json().await

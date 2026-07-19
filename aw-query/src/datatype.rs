@@ -302,7 +302,13 @@ impl TryFrom<DataType> for Value {
         match value {
             DataType::None() => Ok(Value::Null),
             DataType::Bool(b) => Ok(Value::Bool(b)),
-            DataType::Number(n) => Ok(Value::Number(Number::from_f64(n).unwrap())),
+            DataType::Number(n) => Number::from_f64(n)
+                .map(Value::Number)
+                .ok_or_else(|| {
+                    QueryError::InvalidFunctionParameters(format!(
+                        "Cannot convert non-finite number {n} to JSON"
+                    ))
+                }),
             DataType::String(s) => Ok(Value::String(s)),
             DataType::List(l) => {
                 let mut values: Vec<Value> = Vec::with_capacity(l.len());
@@ -310,6 +316,13 @@ impl TryFrom<DataType> for Value {
                     values.push(value.try_into()?);
                 }
                 Ok(Value::Array(values))
+            }
+            DataType::Dict(dict) => {
+                let mut values = serde_json::Map::with_capacity(dict.len());
+                for (key, value) in dict {
+                    values.insert(key, value.try_into()?);
+                }
+                Ok(Value::Object(values))
             }
             invalid_type => Err(QueryError::InvalidFunctionParameters(format!(
                 "Query2 support for parsing values is limited, does not support parsing {invalid_type:?}"
@@ -341,6 +354,27 @@ impl TryFrom<&DataType> for Vec<Value> {
     type Error = QueryError;
     fn try_from(value: &DataType) -> Result<Self, Self::Error> {
         value.clone().try_into()
+    }
+}
+
+#[cfg(test)]
+mod json_conversion_tests {
+    use serde_json::Value;
+
+    use super::DataType;
+
+    #[test]
+    fn rejects_non_finite_numbers_when_converting_to_json() {
+        for number in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let error = Value::try_from(DataType::Number(number)).unwrap_err();
+            assert!(format!("{error}").contains("non-finite number"));
+        }
+    }
+
+    #[test]
+    fn rejects_nested_non_finite_numbers_when_converting_to_json() {
+        let error = Value::try_from(DataType::List(vec![DataType::Number(f64::NAN)])).unwrap_err();
+        assert!(format!("{error}").contains("non-finite number"));
     }
 }
 
