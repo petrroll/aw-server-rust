@@ -150,6 +150,8 @@ pub struct ActivityCoverageSource {
     pub source_id: String,
     pub bucket_ids: Vec<String>,
     pub fields: Vec<String>,
+    #[serde(default)]
+    pub keeps_active: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<SourceScope>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -885,6 +887,18 @@ fn build_activity_coverage_events(
     Ok(query.join(";\n"))
 }
 
+fn build_activity_coverage_active_overrides(sources: &[ActivityCoverageSource]) -> String {
+    sources
+        .iter()
+        .enumerate()
+        .filter(|(_, source)| source.keeps_active)
+        .map(|(index, _)| {
+            format!("not_afk = period_union(not_afk, activity_coverage_period_{index})")
+        })
+        .collect::<Vec<_>>()
+        .join(";\n")
+}
+
 fn build_activity_events(
     sources: &[ActivitySource],
     filter_afk: bool,
@@ -1099,6 +1113,11 @@ pub fn try_build_canonical_events_v2(options: &CanonicalQueryV2Options) -> Resul
             options.hostname.as_deref(),
             enforce_hostname,
         )?);
+        let active_overrides =
+            build_activity_coverage_active_overrides(&options.activity_coverage_sources);
+        if !active_overrides.is_empty() {
+            query.push(active_overrides);
+        }
         query.push("events = filter_period_intersect(events, not_afk)".to_string());
     }
     append_source_enrichment_and_categorization(
@@ -1151,6 +1170,11 @@ pub fn try_build_canonical_events(options: &AdvancedQueryOptions) -> Result<Stri
             options.hostname.as_deref(),
             enforce_hostname,
         )?);
+        let active_overrides =
+            build_activity_coverage_active_overrides(&options.activity_coverage_sources);
+        if !active_overrides.is_empty() {
+            query.push(active_overrides);
+        }
         query.push("events = filter_period_intersect(events, not_afk)".to_string());
     }
     let background_events = build_background_events(
@@ -2243,6 +2267,7 @@ mod tests {
                     source_id: "meeting".to_string(),
                     bucket_ids: vec!["meeting".to_string()],
                     fields: vec!["subject".to_string()],
+                    keeps_active: false,
                     scope: Some(SourceScope::Global),
                     bucket_hosts: BTreeMap::new(),
                     host: None,
@@ -2251,6 +2276,7 @@ mod tests {
                     source_id: "desktop".to_string(),
                     bucket_ids: vec!["desktop".to_string()],
                     fields: vec!["vdesktop".to_string()],
+                    keeps_active: false,
                     scope: Some(SourceScope::Global),
                     bucket_hosts: BTreeMap::new(),
                     host: None,
@@ -3342,6 +3368,7 @@ mod tests {
             source_id: source_id.to_string(),
             bucket_ids: vec![bucket_id.to_string()],
             fields: fields.iter().map(|field| (*field).to_string()).collect(),
+            keeps_active: false,
             scope: Some(SourceScope::Global),
             bucket_hosts: BTreeMap::new(),
             host: None,
@@ -3476,6 +3503,42 @@ mod tests {
             events[0].data["$source.window.title"],
             serde_json::json!("project.rs")
         );
+    }
+
+    #[test]
+    fn test_v2_keeps_configured_coverage_active() {
+        let mut manual = global_coverage_source("manual", "manual", &["label"]);
+        manual.keeps_active = true;
+        let options = CanonicalQueryV2Options {
+            activity_coverage_sources: vec![manual],
+            active_time_rule: Some(serde_json::json!({
+                "type": "regex",
+                "source": "afk",
+                "field": "status",
+                "regex": "not-afk"
+            })),
+            active_time_sources: vec![ActiveTimeSource {
+                source_id: "afk".to_string(),
+                bucket_ids: vec!["afk".to_string()],
+                scope: Some(SourceScope::Global),
+                bucket_hosts: BTreeMap::new(),
+                host: None,
+            }],
+            capabilities: vec![
+                CONTEXT_ENRICHMENT_CAPABILITY.to_string(),
+                ACTIVE_PERIODS_V2_CAPABILITY.to_string(),
+            ],
+            ..CanonicalQueryV2Options::default()
+        };
+
+        let query = try_build_canonical_events_v2(&options).unwrap();
+        let override_index = query
+            .find("not_afk = period_union(not_afk, activity_coverage_period_0)")
+            .unwrap();
+        let mask_index = query
+            .find("events = filter_period_intersect(events, not_afk)")
+            .unwrap();
+        assert!(override_index < mask_index);
     }
 
     #[test]
