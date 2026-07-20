@@ -158,7 +158,33 @@ pub struct ActivityCoverageSource {
     pub host: Option<String>,
 }
 
-/// Optional advanced query features and the server capabilities required by them.
+/// Source-only options for the canonical v2 pipeline.
+///
+/// Coverage sources are the only sources that create canonical event periods. Context sources
+/// only add namespaced facts to those periods, and active-time sources only restrict them.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalQueryV2Options {
+    #[serde(default)]
+    pub hostname: Option<String>,
+    #[serde(default)]
+    pub category_specs: Option<Vec<serde_json::Value>>,
+    #[serde(default)]
+    pub activity_coverage_sources: Vec<ActivityCoverageSource>,
+    #[serde(default)]
+    pub context_sources: Vec<ContextSource>,
+    #[serde(default)]
+    pub active_time_rule: Option<serde_json::Value>,
+    #[serde(default)]
+    pub active_time_sources: Vec<ActiveTimeSource>,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+}
+
+/// Legacy compatibility options for mixing advanced sources into desktop/Android queries.
+///
+/// New source-only canonical queries should use [`CanonicalQueryV2Options`] and
+/// [`try_build_canonical_events_v2`].
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AdvancedQueryOptions {
     #[serde(default)]
@@ -253,7 +279,11 @@ impl QueryParams {
         }
     }
 
-    /// Build canonical events with validated advanced query options.
+    /// Build canonical events with validated legacy compatibility options.
+    #[deprecated(
+        note = "this API mixes legacy platform parameters with advanced sources; use try_build_canonical_events_v2"
+    )]
+    #[allow(deprecated)]
     pub fn try_canonical_events_with_options(
         &self,
         options: &AdvancedQueryOptions,
@@ -418,6 +448,75 @@ fn validate_advanced_options(options: &AdvancedQueryOptions) -> Result<(), Strin
             ));
         }
         validate_background_sources(&options.background_sources, options.hostname.as_deref())?;
+    }
+    Ok(())
+}
+
+fn validate_canonical_query_v2_options(options: &CanonicalQueryV2Options) -> Result<(), String> {
+    validate_query_strings(options)?;
+    if options.hostname.as_ref().is_some_and(String::is_empty) {
+        return Err("hostname must be non-empty".to_string());
+    }
+    if options.category_specs.is_some()
+        && !options
+            .capabilities
+            .iter()
+            .any(|capability| capability == CATEGORIZE_V2_CAPABILITY)
+    {
+        return Err(format!(
+            "Flexible categorization requires server capability {CATEGORIZE_V2_CAPABILITY}"
+        ));
+    }
+    if (!options.context_sources.is_empty() || !options.activity_coverage_sources.is_empty())
+        && !options
+            .capabilities
+            .iter()
+            .any(|capability| capability == CONTEXT_ENRICHMENT_CAPABILITY)
+    {
+        return Err(format!(
+            "Context enrichment requires server capability {CONTEXT_ENRICHMENT_CAPABILITY}"
+        ));
+    }
+    validate_context_sources(&options.context_sources, options.hostname.as_deref())?;
+    validate_activity_coverage_sources(
+        &options.activity_coverage_sources,
+        options.hostname.as_deref(),
+    )?;
+
+    let mut fact_source_ids = std::collections::BTreeSet::new();
+    for source_id in options
+        .activity_coverage_sources
+        .iter()
+        .map(|source| source.source_id.as_str())
+        .chain(
+            options
+                .context_sources
+                .iter()
+                .map(|source| source.source_id.as_str()),
+        )
+    {
+        if !fact_source_ids.insert(source_id) {
+            return Err(format!("duplicate canonical fact source id: {source_id:?}"));
+        }
+    }
+
+    if options.active_time_rule.is_some() || !options.active_time_sources.is_empty() {
+        if !options
+            .capabilities
+            .iter()
+            .any(|capability| capability == ACTIVE_PERIODS_V2_CAPABILITY)
+        {
+            return Err(format!(
+                "Active-time rules require server capability {ACTIVE_PERIODS_V2_CAPABILITY}"
+            ));
+        }
+        if options.active_time_rule.is_none() {
+            return Err("active-time sources require a rule".to_string());
+        }
+        if options.active_time_sources.is_empty() {
+            return Err("active-time rules require at least one source".to_string());
+        }
+        validate_active_time_sources(&options.active_time_sources, options.hostname.as_deref())?;
     }
     Ok(())
 }
@@ -937,22 +1036,31 @@ fn append_enrichment_and_categorization(
     query: &mut Vec<String>,
     options: &AdvancedQueryOptions,
 ) -> Result<bool, String> {
-    let enforce_hostname = options
-        .capabilities
+    append_source_enrichment_and_categorization(
+        query,
+        options.hostname.as_deref(),
+        &options.context_sources,
+        options.category_specs.as_deref(),
+        &options.capabilities,
+    )
+}
+
+fn append_source_enrichment_and_categorization(
+    query: &mut Vec<String>,
+    hostname: Option<&str>,
+    context_sources: &[ContextSource],
+    category_specs: Option<&[serde_json::Value]>,
+    capabilities: &[String],
+) -> Result<bool, String> {
+    let enforce_hostname = capabilities
         .iter()
         .any(|capability| capability == OPTIONAL_BUCKET_HOSTNAME_CAPABILITY);
-    let context_events = build_context_events(
-        &options.context_sources,
-        options.hostname.as_deref(),
-        enforce_hostname,
-    )?;
+    let context_events = build_context_events(context_sources, hostname, enforce_hostname)?;
     if !context_events.is_empty() {
         query.push(context_events);
     }
-    if let Some(category_specs) = &options.category_specs {
-        let host = options
-            .hostname
-            .as_ref()
+    if let Some(category_specs) = category_specs {
+        let host = hostname
             .map(|host| format!(", {}", serialize_query_json(host)))
             .unwrap_or_default();
         query.push(format!(
@@ -964,7 +1072,50 @@ fn append_enrichment_and_categorization(
     Ok(false)
 }
 
-/// Build canonical events from explicit sources without assuming a window or legacy AFK bucket.
+/// Build canonical events exclusively from explicit coverage, context, and active-time sources.
+///
+/// Coverage contributes only periods plus namespaced `$source.<id>.<field>` facts. Context and
+/// active-time sources cannot create event periods.
+pub fn try_build_canonical_events_v2(options: &CanonicalQueryV2Options) -> Result<String, String> {
+    validate_canonical_query_v2_options(options)?;
+
+    let mut query = vec!["events = []".to_string()];
+    let enforce_hostname = options
+        .capabilities
+        .iter()
+        .any(|capability| capability == OPTIONAL_BUCKET_HOSTNAME_CAPABILITY);
+    let coverage_events = build_activity_coverage_events(
+        &options.activity_coverage_sources,
+        options.hostname.as_deref(),
+        enforce_hostname,
+    )?;
+    if !coverage_events.is_empty() {
+        query.push(coverage_events);
+    }
+    if let Some(active_time_rule) = &options.active_time_rule {
+        query.push(build_active_time_events(
+            &options.active_time_sources,
+            active_time_rule,
+            options.hostname.as_deref(),
+            enforce_hostname,
+        )?);
+        query.push("events = filter_period_intersect(events, not_afk)".to_string());
+    }
+    append_source_enrichment_and_categorization(
+        &mut query,
+        options.hostname.as_deref(),
+        &options.context_sources,
+        options.category_specs.as_deref(),
+        &options.capabilities,
+    )?;
+
+    Ok(query.join(";\n"))
+}
+
+/// Build canonical events with legacy replacement/background source support.
+#[deprecated(
+    note = "replacement/background activity sources are not part of canonical v2; use try_build_canonical_events_v2"
+)]
 pub fn try_build_canonical_events(options: &AdvancedQueryOptions) -> Result<String, String> {
     validate_advanced_options(options)?;
     if !options.background_sources.is_empty() && options.active_time_rule.is_none() {
@@ -1078,6 +1229,9 @@ pub fn build_desktop_canonical_events(params: &DesktopQueryParams) -> String {
         .expect("legacy desktop query parameters are valid")
 }
 
+#[deprecated(
+    note = "this API mixes legacy desktop parameters with advanced sources; use try_build_canonical_events_v2"
+)]
 pub fn try_build_desktop_canonical_events_with_options(
     params: &DesktopQueryParams,
     options: &AdvancedQueryOptions,
@@ -1416,6 +1570,7 @@ fn serialize_bucket_id(bucket_id: &str) -> Result<String, String> {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
 
@@ -3129,6 +3284,280 @@ mod tests {
         assert!(legacy_query.ends_with("RETURN = not_afk;"));
         assert!(!legacy_query.contains("window"));
         assert!(!legacy_query.contains("events ="));
+    }
+
+    fn insert_v2_test_event(
+        datastore: &aw_datastore::Datastore,
+        bucket_id: &str,
+        data: serde_json::Map<String, serde_json::Value>,
+    ) {
+        let timestamp = chrono::DateTime::parse_from_rfc3339("2024-06-01T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        datastore
+            .create_bucket(&aw_models::Bucket {
+                bid: None,
+                id: bucket_id.to_string(),
+                _type: "test".to_string(),
+                client: "test".to_string(),
+                hostname: "test".to_string(),
+                created: Some(timestamp),
+                data: serde_json::Map::new(),
+                metadata: aw_models::BucketMetadata::default(),
+                events: None,
+                last_updated: None,
+            })
+            .unwrap();
+        datastore
+            .insert_events(
+                bucket_id,
+                &[aw_models::Event::new(
+                    timestamp,
+                    chrono::Duration::seconds(10),
+                    data,
+                )],
+            )
+            .unwrap();
+    }
+
+    fn run_v2_query(
+        datastore: &aw_datastore::Datastore,
+        options: &CanonicalQueryV2Options,
+    ) -> Vec<aw_models::Event> {
+        let query = try_build_canonical_events_v2(options).unwrap();
+        let interval =
+            aw_models::TimeInterval::new_from_string("2024-06-01T12:00:00Z/2024-06-01T12:01:00Z")
+                .unwrap();
+        let result =
+            aw_query::query(&format!("{query}; return events;"), &interval, datastore).unwrap();
+        Vec::<aw_models::Event>::try_from(&result).unwrap()
+    }
+
+    fn global_coverage_source(
+        source_id: &str,
+        bucket_id: &str,
+        fields: &[&str],
+    ) -> ActivityCoverageSource {
+        ActivityCoverageSource {
+            source_id: source_id.to_string(),
+            bucket_ids: vec![bucket_id.to_string()],
+            fields: fields.iter().map(|field| (*field).to_string()).collect(),
+            scope: Some(SourceScope::Global),
+            bucket_hosts: BTreeMap::new(),
+            host: None,
+        }
+    }
+
+    #[test]
+    fn test_v2_meeting_only_coverage_needs_no_window_or_afk() {
+        let datastore = aw_datastore::Datastore::new_in_memory(false);
+        insert_v2_test_event(
+            &datastore,
+            "meeting",
+            serde_json::Map::from_iter([("subject".to_string(), serde_json::json!("Planning"))]),
+        );
+        let options = CanonicalQueryV2Options {
+            activity_coverage_sources: vec![global_coverage_source(
+                "meeting",
+                "meeting",
+                &["subject"],
+            )],
+            capabilities: vec![CONTEXT_ENRICHMENT_CAPABILITY.to_string()],
+            ..CanonicalQueryV2Options::default()
+        };
+
+        let query = try_build_canonical_events_v2(&options).unwrap();
+        assert!(!query.contains("find_bucket"));
+        assert!(!query.contains("not_afk"));
+        let events = run_v2_query(&datastore, &options);
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].data["$source.meeting.subject"],
+            serde_json::json!("Planning")
+        );
+        assert_eq!(events[0].data.len(), 1);
+    }
+
+    #[test]
+    fn test_v2_stopwatch_like_coverage_keeps_only_namespaced_facts() {
+        let datastore = aw_datastore::Datastore::new_in_memory(false);
+        insert_v2_test_event(
+            &datastore,
+            "stopwatch",
+            serde_json::Map::from_iter([("label".to_string(), serde_json::json!("Focused work"))]),
+        );
+        let options = CanonicalQueryV2Options {
+            activity_coverage_sources: vec![global_coverage_source(
+                "stopwatch",
+                "stopwatch",
+                &["label"],
+            )],
+            capabilities: vec![CONTEXT_ENRICHMENT_CAPABILITY.to_string()],
+            ..CanonicalQueryV2Options::default()
+        };
+
+        let events = run_v2_query(&datastore, &options);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].data.len(), 1);
+        assert_eq!(
+            events[0].data["$source.stopwatch.label"],
+            serde_json::json!("Focused work")
+        );
+    }
+
+    #[test]
+    fn test_v2_unreferenced_currentwindow_is_inert() {
+        let datastore = aw_datastore::Datastore::new_in_memory(false);
+        insert_v2_test_event(
+            &datastore,
+            "meeting",
+            serde_json::Map::from_iter([("subject".to_string(), serde_json::json!("Planning"))]),
+        );
+        insert_v2_test_event(
+            &datastore,
+            "currentwindow",
+            serde_json::Map::from_iter([
+                ("app".to_string(), serde_json::json!("editor")),
+                ("title".to_string(), serde_json::json!("secret.rs")),
+            ]),
+        );
+        let options = CanonicalQueryV2Options {
+            activity_coverage_sources: vec![global_coverage_source(
+                "meeting",
+                "meeting",
+                &["subject"],
+            )],
+            capabilities: vec![CONTEXT_ENRICHMENT_CAPABILITY.to_string()],
+            ..CanonicalQueryV2Options::default()
+        };
+
+        let query = try_build_canonical_events_v2(&options).unwrap();
+        assert!(!query.contains("currentwindow"));
+        let events = run_v2_query(&datastore, &options);
+        assert_eq!(events.len(), 1);
+        assert!(!events[0].data.contains_key("app"));
+        assert!(!events[0].data.contains_key("title"));
+        assert!(!events[0]
+            .data
+            .keys()
+            .any(|key| key.contains("currentwindow")));
+    }
+
+    #[test]
+    fn test_v2_explicit_window_source_is_namespaced_only() {
+        let datastore = aw_datastore::Datastore::new_in_memory(false);
+        insert_v2_test_event(
+            &datastore,
+            "currentwindow",
+            serde_json::Map::from_iter([
+                ("app".to_string(), serde_json::json!("editor")),
+                ("title".to_string(), serde_json::json!("project.rs")),
+            ]),
+        );
+        let options = CanonicalQueryV2Options {
+            activity_coverage_sources: vec![global_coverage_source(
+                "window",
+                "currentwindow",
+                &["app", "title"],
+            )],
+            capabilities: vec![CONTEXT_ENRICHMENT_CAPABILITY.to_string()],
+            ..CanonicalQueryV2Options::default()
+        };
+
+        let events = run_v2_query(&datastore, &options);
+        assert_eq!(events.len(), 1);
+        assert!(!events[0].data.contains_key("app"));
+        assert!(!events[0].data.contains_key("title"));
+        assert_eq!(
+            events[0].data["$source.window.app"],
+            serde_json::json!("editor")
+        );
+        assert_eq!(
+            events[0].data["$source.window.title"],
+            serde_json::json!("project.rs")
+        );
+    }
+
+    #[test]
+    fn test_v2_context_and_active_time_sources_cannot_create_coverage() {
+        let datastore = aw_datastore::Datastore::new_in_memory(false);
+        insert_v2_test_event(
+            &datastore,
+            "context",
+            serde_json::Map::from_iter([(
+                "project".to_string(),
+                serde_json::json!("activitywatch"),
+            )]),
+        );
+        insert_v2_test_event(
+            &datastore,
+            "presence",
+            serde_json::Map::from_iter([("state".to_string(), serde_json::json!("active"))]),
+        );
+
+        let context_only = CanonicalQueryV2Options {
+            context_sources: vec![ContextSource {
+                source_id: "context".to_string(),
+                bucket_ids: vec!["context".to_string()],
+                scope: Some(SourceScope::Global),
+                bucket_hosts: BTreeMap::new(),
+                fields: vec!["project".to_string()],
+                conflict: "base_wins".to_string(),
+                host: None,
+            }],
+            capabilities: vec![CONTEXT_ENRICHMENT_CAPABILITY.to_string()],
+            ..CanonicalQueryV2Options::default()
+        };
+        assert!(run_v2_query(&datastore, &context_only).is_empty());
+
+        let active_only = CanonicalQueryV2Options {
+            active_time_rule: Some(serde_json::json!({
+                "type": "regex",
+                "source": "presence",
+                "field": "state",
+                "regex": "^active$"
+            })),
+            active_time_sources: vec![ActiveTimeSource {
+                source_id: "presence".to_string(),
+                bucket_ids: vec!["presence".to_string()],
+                scope: Some(SourceScope::Global),
+                bucket_hosts: BTreeMap::new(),
+                host: None,
+            }],
+            capabilities: vec![ACTIVE_PERIODS_V2_CAPABILITY.to_string()],
+            ..CanonicalQueryV2Options::default()
+        };
+        assert!(run_v2_query(&datastore, &active_only).is_empty());
+    }
+
+    #[test]
+    fn test_v2_options_reject_every_legacy_source_path() {
+        for field in [
+            "bid_window",
+            "bid_afk",
+            "bid_browsers",
+            "bid_stopwatch",
+            "always_active_pattern",
+            "legacy_window_mode",
+            "legacy_window_fields",
+            "activity_sources",
+            "background_sources",
+        ] {
+            let mut value = serde_json::json!({});
+            value
+                .as_object_mut()
+                .unwrap()
+                .insert(field.to_string(), serde_json::json!([]));
+            assert!(
+                serde_json::from_value::<CanonicalQueryV2Options>(value).is_err(),
+                "v2 options unexpectedly accepted {field}"
+            );
+        }
+
+        let query = try_build_canonical_events_v2(&CanonicalQueryV2Options::default()).unwrap();
+        assert_eq!(query, "events = []");
+        assert!(!query.contains("find_bucket"));
+        assert!(!query.contains("map_event_fields"));
     }
 
     #[test]
