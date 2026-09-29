@@ -56,6 +56,7 @@ mod export;
 mod hostcheck;
 mod import;
 mod query;
+mod rules_settings;
 mod settings;
 
 pub use util::HttpErrorJson;
@@ -119,12 +120,16 @@ fn server_info(config: &State<AWConfig>, state: &State<ServerState>) -> Json<Inf
             device_id: state.device_id.clone(),
         },
         capabilities: vec![
+            "settings.rules_v2.v1".to_string(),
             "query.categorize_v2.v1".to_string(),
             "query.categorize_v2_explain.v1".to_string(),
             "query.active_periods_v2.v1".to_string(),
             "query.merge_subwatcher_fields.source_namespace.v1".to_string(),
             "query.map_event_fields.v1".to_string(),
             "query.query_bucket_optional.expected_hostname.v1".to_string(),
+            "query.query_bucket_optional_raw.v1".to_string(),
+            "query.query_period.v1".to_string(),
+            "query.flood_v2.v1".to_string(),
         ],
     })
 }
@@ -199,6 +204,8 @@ pub fn build_rocket(server_state: ServerState, config: AWConfig) -> rocket::Rock
         .mount(
             "/api/0/settings",
             routes![
+                settings::rules_get,
+                settings::rules_set,
                 settings::setting_get,
                 settings::setting_set,
                 settings::setting_delete,

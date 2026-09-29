@@ -23,6 +23,17 @@ pub fn fill_env(env: &mut VarEnv) {
         ),
     );
     env.insert(
+        "query_bucket_optional_raw".to_string(),
+        DataType::Function(
+            "query_bucket_optional_raw".to_string(),
+            qfunctions::query_bucket_optional_raw,
+        ),
+    );
+    env.insert(
+        "query_period".to_string(),
+        DataType::Function("query_period".to_string(), qfunctions::query_period),
+    );
+    env.insert(
         "query_bucket_names".to_string(),
         DataType::Function(
             "query_bucket_names".to_string(),
@@ -55,6 +66,10 @@ pub fn fill_env(env: &mut VarEnv) {
     env.insert(
         "flood".to_string(),
         DataType::Function("flood".to_string(), qfunctions::flood),
+    );
+    env.insert(
+        "flood_v2".to_string(),
+        DataType::Function("flood_v2".to_string(), qfunctions::flood_v2),
     );
     env.insert(
         "find_bucket".to_string(),
@@ -205,6 +220,7 @@ mod qfunctions {
         Ok(DataType::List(ret))
     }
 
+    /// Legacy Query2 optional read with the public clipped-event semantics.
     pub fn query_bucket_optional(
         mut args: Vec<DataType>,
         env: &VarEnv,
@@ -248,6 +264,144 @@ mod qfunctions {
         Ok(DataType::List(
             events.into_iter().map(DataType::Event).collect(),
         ))
+    }
+
+    /// Fetch overlapping source records while retaining their stored bounds.
+    ///
+    /// The optional third argument expands only the lookup interval on each
+    /// side by 0 through 3600 seconds, at microsecond precision. A null second
+    /// argument means that no hostname check is applied. Neither the original
+    /// query interval nor returned event timestamps/durations are changed.
+    pub fn query_bucket_optional_raw(
+        mut args: Vec<DataType>,
+        env: &VarEnv,
+        ds: &Datastore,
+    ) -> Result<DataType, QueryError> {
+        if !(1..=3).contains(&args.len()) {
+            return Err(QueryError::InvalidFunctionParameters(format!(
+                "Expected 1 to 3 parameters in function, got {}",
+                args.len()
+            )));
+        }
+
+        let padding_seconds = if args.len() == 3 {
+            match args.pop().unwrap() {
+                DataType::Number(seconds) => seconds,
+                invalid_type => {
+                    return Err(QueryError::InvalidFunctionParameters(format!(
+                        "query_bucket_optional_raw padding_seconds must be a finite number between 0 and 3600, got {invalid_type:?}"
+                    )))
+                }
+            }
+        } else {
+            0.0
+        };
+        if !padding_seconds.is_finite() || !(0.0..=3600.0).contains(&padding_seconds) {
+            return Err(QueryError::InvalidFunctionParameters(
+                "query_bucket_optional_raw padding_seconds must be a finite number between 0 and 3600"
+                    .to_string(),
+            ));
+        }
+        // Round half-up once to the common Python/Rust microsecond precision.
+        let padding_microseconds = (padding_seconds * 1_000_000.0 + 0.5).floor() as i64;
+        let padding = chrono::Duration::microseconds(padding_microseconds);
+
+        let expected_hostname = if args.len() == 2 {
+            match args.pop().unwrap() {
+                DataType::None() => None,
+                DataType::String(hostname) => Some(hostname),
+                invalid_type => {
+                    return Err(QueryError::InvalidFunctionParameters(format!(
+                        "query_bucket_optional_raw expected_hostname must be a String or null, got {invalid_type:?}"
+                    )))
+                }
+            }
+        } else {
+            None
+        };
+        let bucket_id: String = args.pop().unwrap().try_into()?;
+        let interval = validate::get_timeinterval(env)?;
+        // Padding must not turn an empty/reversed caller interval into a load.
+        if interval.end() <= interval.start() {
+            return Ok(DataType::List(Vec::new()));
+        }
+
+        if let Some(expected_hostname) = expected_hostname {
+            match ds.get_bucket(bucket_id.as_str()) {
+                Ok(bucket) if bucket.hostname == expected_hostname => {}
+                Ok(_) | Err(DatastoreError::NoSuchBucket(_)) => {
+                    return Ok(DataType::List(Vec::new()))
+                }
+                Err(error) => {
+                    return Err(QueryError::DatastoreQueryError(format!(
+                        "Failed to inspect bucket: {error:?}"
+                    )))
+                }
+            }
+        }
+        let lookup_start = interval
+            .start()
+            .checked_sub_signed(padding)
+            .ok_or_else(|| {
+                QueryError::InvalidFunctionParameters(
+                    "query_bucket_optional_raw padding exceeds the supported datetime range"
+                        .to_string(),
+                )
+            })?;
+        let lookup_end = interval.end().checked_add_signed(padding).ok_or_else(|| {
+            QueryError::InvalidFunctionParameters(
+                "query_bucket_optional_raw padding exceeds the supported datetime range"
+                    .to_string(),
+            )
+        })?;
+        let mut events = match ds.get_events_unclipped(
+            bucket_id.as_str(),
+            Some(lookup_start),
+            Some(lookup_end),
+            None,
+        ) {
+            Ok(events) => events,
+            Err(DatastoreError::NoSuchBucket(_)) => Vec::new(),
+            Err(error) => {
+                return Err(QueryError::DatastoreQueryError(format!(
+                    "Failed to query bucket: {error:?}"
+                )))
+            }
+        };
+        events.sort_by_key(|event| {
+            (
+                event.timestamp,
+                event.calculate_endtime(),
+                event.id.unwrap_or(i64::MIN),
+            )
+        });
+        Ok(DataType::List(
+            events
+                .into_iter()
+                .filter(|event| {
+                    event.timestamp < lookup_end && event.calculate_endtime() > lookup_start
+                })
+                .map(DataType::Event)
+                .collect(),
+        ))
+    }
+
+    pub fn query_period(
+        args: Vec<DataType>,
+        env: &VarEnv,
+        _ds: &Datastore,
+    ) -> Result<DataType, QueryError> {
+        validate::args_length(&args, 0)?;
+        let interval = validate::get_timeinterval(env)?;
+        if interval.end() <= interval.start() {
+            return Ok(DataType::List(Vec::new()));
+        }
+        Ok(DataType::List(vec![DataType::Event(Event {
+            id: None,
+            timestamp: *interval.start(),
+            duration: *interval.end() - *interval.start(),
+            data: serde_json::Map::new(),
+        })]))
     }
 
     pub fn query_bucket_names(
@@ -359,6 +513,39 @@ mod qfunctions {
         Ok(DataType::List(tagged_flooded_events))
     }
 
+    pub fn flood_v2(
+        args: Vec<DataType>,
+        _env: &VarEnv,
+        _ds: &Datastore,
+    ) -> Result<DataType, QueryError> {
+        if !(1..=2).contains(&args.len()) {
+            return Err(QueryError::InvalidFunctionParameters(format!(
+                "Expected 1 to 2 parameters in function, got {}",
+                args.len()
+            )));
+        }
+        let mut args = args.into_iter();
+        let events: Vec<Event> = args.next().unwrap().try_into()?;
+        let threshold_seconds = match args.next() {
+            Some(value) => f64::try_from(value)?,
+            None => 5.0,
+        };
+        if !threshold_seconds.is_finite()
+            || threshold_seconds < 0.0
+            || threshold_seconds > i64::MAX as f64 / 1_000_000.0
+        {
+            return Err(QueryError::InvalidFunctionParameters(
+                "flood_v2 threshold_seconds must be a finite non-negative number".to_string(),
+            ));
+        }
+        let threshold = chrono::Duration::microseconds((threshold_seconds * 1_000_000.0) as i64);
+        let events = aw_transform::flood_v2(events, threshold)
+            .map_err(QueryError::InvalidFunctionParameters)?;
+        Ok(DataType::List(
+            events.into_iter().map(DataType::Event).collect(),
+        ))
+    }
+
     pub fn categorize(
         args: Vec<DataType>,
         _env: &VarEnv,
@@ -370,7 +557,8 @@ mod qfunctions {
         let events: Vec<Event> = args.next().unwrap().try_into()?;
         let rules: Vec<(Vec<String>, Rule)> = args.next().unwrap().try_into()?;
         // Run categorize
-        let mut flooded_events = aw_transform::classify::categorize(events, &rules);
+        let mut flooded_events = aw_transform::classify::categorize(events, &rules)
+            .map_err(QueryError::InvalidFunctionParameters)?;
         // Put events back into DataType::Event container
         let mut tagged_flooded_events = Vec::new();
         for event in flooded_events.drain(..) {

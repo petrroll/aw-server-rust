@@ -4,6 +4,7 @@ use std::net::TcpListener;
 use std::thread;
 
 use aw_client_rust::blocking;
+use aw_client_rust::rules_v2::{ProfileQueryError, ProfileQueryRequest};
 use aw_client_rust::AwClient;
 
 fn block_on<F: Future>(future: F) -> F::Output {
@@ -135,5 +136,77 @@ fn blocking_client_rejects_non_success_statuses() {
         .expect_err("409 response must fail for blocking client");
     assert_eq!(err.status(), Some(reqwest::StatusCode::CONFLICT));
 
+    handle.join().expect("join mock server");
+}
+
+const PROFILE_INFO: &str = r#"{
+    "hostname":"host",
+    "version":"test",
+    "testing":true,
+    "device_id":"device",
+    "capabilities":[
+        "settings.rules_v2.v1",
+        "query.query_bucket_optional_raw.v1",
+        "query.query_period.v1",
+        "query.flood_v2.v1",
+        "query.merge_subwatcher_fields.source_namespace.v1",
+        "query.active_periods_v2.v1",
+        "query.categorize_v2.v1"
+    ]
+}"#;
+
+#[test]
+fn profile_loader_does_not_fallback_on_a_non_404_response() {
+    let (port, handle) = spawn_mock_server(vec![
+        MockResponse {
+            status_line: "200 OK",
+            content_type: "application/json",
+            body: PROFILE_INFO,
+        },
+        MockResponse {
+            status_line: "500 Internal Server Error",
+            content_type: "application/json",
+            body: "{}",
+        },
+    ]);
+    let client = AwClient::new("127.0.0.1", port, "aw-client-rust-test").expect("create client");
+
+    let error = block_on(client.build_profile_query_v2(&ProfileQueryRequest::for_hostname("host")))
+        .expect_err("a canonical settings server error must not trigger legacy fallback");
+    match error {
+        ProfileQueryError::Http(error) => assert_eq!(
+            error.status(),
+            Some(reqwest::StatusCode::INTERNAL_SERVER_ERROR)
+        ),
+        other => panic!("expected HTTP error, got {other}"),
+    }
+    handle.join().expect("join mock server");
+}
+
+#[test]
+fn profile_loader_rejects_a_malformed_present_document_without_fallback() {
+    let (port, handle) = spawn_mock_server(vec![
+        MockResponse {
+            status_line: "200 OK",
+            content_type: "application/json",
+            body: PROFILE_INFO,
+        },
+        MockResponse {
+            status_line: "200 OK",
+            content_type: "application/json",
+            body: "null",
+        },
+        MockResponse {
+            status_line: "200 OK",
+            content_type: "application/json",
+            body: "{}",
+        },
+    ]);
+    let client = AwClient::new("127.0.0.1", port, "aw-client-rust-test").expect("create client");
+
+    let error = block_on(client.build_profile_query_v2(&ProfileQueryRequest::for_hostname("host")))
+        .expect_err("a malformed present canonical document must fail");
+    assert!(matches!(error, ProfileQueryError::Invalid(_)));
+    assert!(error.to_string().contains("invalid rules_v2 document"));
     handle.join().expect("join mock server");
 }

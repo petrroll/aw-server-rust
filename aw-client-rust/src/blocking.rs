@@ -91,6 +91,22 @@ impl AwClient {
     proxy_method!(get_info_with_capabilities, aw_models::InfoWithCapabilities,);
     proxy_method!(get_setting, serde_json::Value, setting: &str);
     proxy_method!(get_settings, aw_models::Settings,);
+    proxy_method!(get_settings_value, serde_json::Value,);
+
+    pub fn build_profile_query_v2(
+        &self,
+        request: &crate::rules_v2::ProfileQueryRequest,
+    ) -> Result<crate::rules_v2::MaterializedProfileV2, crate::rules_v2::ProfileQueryError> {
+        block_on(self.client.build_profile_query_v2(request))
+    }
+
+    pub fn query_profile_v2(
+        &self,
+        request: &crate::rules_v2::ProfileQueryRequest,
+        timeperiods: Vec<(DateTime<Utc>, DateTime<Utc>)>,
+    ) -> Result<Vec<serde_json::Value>, crate::rules_v2::ProfileQueryError> {
+        block_on(self.client.query_profile_v2(request, timeperiods))
+    }
 
     pub fn wait_for_start(&self) -> Result<(), Box<dyn Error>> {
         self.client.wait_for_start()

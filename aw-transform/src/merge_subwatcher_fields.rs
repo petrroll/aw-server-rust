@@ -4,9 +4,11 @@ use std::collections::{BTreeSet, BinaryHeap};
 use aw_models::Event;
 use chrono::{DateTime, Utc};
 
+use crate::fact_resolver::resolve_fact_slices;
+
 pub fn merge_subwatcher_fields(
     base_events: Vec<Event>,
-    mut subwatcher_events: Vec<Event>,
+    subwatcher_events: Vec<Event>,
     keys: &[String],
     conflict: &str,
     source_id: Option<&str>,
@@ -29,6 +31,7 @@ pub fn merge_subwatcher_fields(
         return Ok(base_events);
     }
 
+    let mut subwatcher_events = resolve_fact_slices(&subwatcher_events);
     subwatcher_events.sort_by_key(|event| event.timestamp);
     let mut base_order: Vec<usize> = (0..base_events.len()).collect();
     base_order.sort_by_key(|index| base_events[*index].timestamp);

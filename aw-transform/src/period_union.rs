@@ -75,6 +75,23 @@ mod tests {
     }
 
     #[test]
+    fn period_union_does_not_modify_referenced_inputs() {
+        let event = Event {
+            id: Some(7),
+            timestamp: DateTime::from_str("2000-01-01T00:00:01Z").unwrap(),
+            duration: Duration::seconds(1),
+            data: json_map! {"owner": json!("canonical")},
+        };
+        let input = vec![event.clone()];
+
+        let result = period_union(&[], &input);
+
+        assert_eq!(input, vec![event]);
+        assert_eq!(result.len(), 1);
+        assert!(result[0].data.is_empty());
+    }
+
+    #[test]
     fn test_period_union() {
         let e1 = Event {
             id: None,

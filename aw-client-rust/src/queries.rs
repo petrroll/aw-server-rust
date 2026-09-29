@@ -1,16 +1,11 @@
 //! Query building utilities for ActivityWatch
 //!
-//! This module provides functionality to build canonical queries that are compatible
-//! with the ActivityWatch query language. It includes support for:
+//! This module builds canonical Query2 programs. Desktop compatibility signatures
+//! translate into the current source pipeline; explicitly selected old-server and
+//! Android grammar lives in [`legacy_v1`]. Settings-aware callers should use
+//! [`crate::AwClient::build_profile_query_v2`].
 //!
-//! - Desktop and Android query parameters
-//! - Server-side categorization classes fetching
-//! - Browser events integration
-//! - AFK filtering
-//!
-//! ## Server-side Classes
-//!
-//! The queries can automatically fetch categorization classes from the ActivityWatch server:
+//! ## Desktop compatibility
 //!
 //! ```rust
 //! use aw_client_rust::queries::{DesktopQueryParams, QueryParams, QueryParamsBase};
@@ -18,7 +13,7 @@
 //! let params = DesktopQueryParams {
 //!     base: QueryParamsBase {
 //!         bid_browsers: vec![],
-//!         classes: vec![], // Empty - will fetch from server
+//!         classes: vec![], // Empty selects the shared built-in defaults.
 //!         filter_classes: vec![],
 //!         filter_afk: true,
 //!         include_audible: true,
@@ -28,7 +23,6 @@
 //!     always_active_pattern: None,
 //! };
 //!
-//! // Automatically fetches classes from localhost:5600
 //! let query = QueryParams::Desktop(params.clone()).canonical_events();
 //!
 //! ```
@@ -77,6 +71,41 @@ pub static BROWSER_APPNAMES: phf::Map<&'static str, &'static [&'static str]> = p
     "vivaldi" => &["Vivaldi-stable", "Vivaldi-snapshot", "vivaldi.exe"],
 };
 
+pub(crate) const CURRENT_BROWSER_FAMILIES: &[(&str, &[&str], &str)] = &[
+    (
+        "chrome",
+        &[
+            "com.google.Chrome",
+            "com.google.ChromeDev",
+            "org.chromium.Chromium",
+        ],
+        "(?i)^(google[-_ ]?chrome|chrome|chromium)",
+    ),
+    (
+        "firefox",
+        &[
+            "org.mozilla.firefox",
+            "io.gitlab.librewolf-community",
+            "net.waterfox.waterfox",
+        ],
+        "(?i)(firefox|librewolf|waterfox|nightly)",
+    ),
+    ("opera", &["com.opera.Opera"], "(?i)(opera)"),
+    ("brave", &["com.brave.Browser"], "(?i)(brave)"),
+    (
+        "edge",
+        &["com.microsoft.Edge", "com.microsoft.EdgeDev"],
+        "(?i)^(microsoft[-_ ]?edge|msedge)",
+    ),
+    ("arc", &[], "(?i)^arc(\\.exe)?$"),
+    ("vivaldi", &["com.vivaldi.Vivaldi"], "(?i)(vivaldi)"),
+    ("orion", &["Orion"], "(?i)(orion)"),
+    ("yandex", &["ru.yandex.Browser"], "(?i)(yandex)"),
+    ("zen", &["app.zen_browser.zen"], "(?i)(zen)"),
+    ("floorp", &["one.ablaze.floorp"], "(?i)(floorp)"),
+    ("helium", &["net.imput.helium"], "(?i)(helium)"),
+];
+
 pub const DEFAULT_LIMIT: u32 = 100;
 pub const CATEGORIZE_V2_CAPABILITY: &str = "query.categorize_v2.v1";
 pub const CONTEXT_ENRICHMENT_CAPABILITY: &str = "query.merge_subwatcher_fields.source_namespace.v1";
@@ -84,6 +113,10 @@ pub const ACTIVE_PERIODS_V2_CAPABILITY: &str = "query.active_periods_v2.v1";
 pub const MAP_EVENT_FIELDS_CAPABILITY: &str = "query.map_event_fields.v1";
 pub const OPTIONAL_BUCKET_HOSTNAME_CAPABILITY: &str =
     "query.query_bucket_optional.expected_hostname.v1";
+pub const OPTIONAL_BUCKET_RAW_CAPABILITY: &str = "query.query_bucket_optional_raw.v1";
+pub const QUERY_PERIOD_CAPABILITY: &str = "query.query_period.v1";
+pub const FLOOD_V2_CAPABILITY: &str = "query.flood_v2.v1";
+pub const EXPLAIN_CATEGORIZE_V2_CAPABILITY: &str = "query.categorize_v2_explain.v1";
 
 /// Type alias for categorization classes
 pub type ClassRule = (CategoryId, CategorySpec);
@@ -94,6 +127,15 @@ pub type ClassRule = (CategoryId, CategorySpec);
 pub enum SourceScope {
     Host,
     Global,
+}
+
+/// How source heartbeat gaps contribute to facts and coverage.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IntervalPolicy {
+    #[default]
+    Exact,
+    Heartbeat,
 }
 
 /// Additional event fields to merge from one or more context buckets.
@@ -110,6 +152,8 @@ pub struct ContextSource {
     pub conflict: String,
     #[serde(default)]
     pub host: Option<String>,
+    #[serde(default)]
+    pub interval_policy: IntervalPolicy,
 }
 
 fn default_context_conflict() -> String {
@@ -127,6 +171,8 @@ pub struct ActiveTimeSource {
     pub bucket_hosts: BTreeMap<String, String>,
     #[serde(default)]
     pub host: Option<String>,
+    #[serde(default)]
+    pub interval_policy: IntervalPolicy,
 }
 
 /// A replacement activity stream with optional canonical field mappings.
@@ -142,6 +188,8 @@ pub struct ActivitySource {
     pub field_mappings: BTreeMap<String, String>,
     #[serde(default)]
     pub host: Option<String>,
+    #[serde(default)]
+    pub interval_policy: IntervalPolicy,
 }
 
 /// A source whose event periods contribute to abstract activity coverage.
@@ -158,13 +206,15 @@ pub struct ActivityCoverageSource {
     pub bucket_hosts: BTreeMap<String, String>,
     #[serde(default)]
     pub host: Option<String>,
+    #[serde(default)]
+    pub interval_policy: IntervalPolicy,
 }
 
 /// Source-only options for the canonical v2 pipeline.
 ///
 /// Coverage sources are the only sources that create canonical event periods. Context sources
 /// only add namespaced facts to those periods, and active-time sources only restrict them.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CanonicalQueryV2Options {
     #[serde(default)]
@@ -181,6 +231,29 @@ pub struct CanonicalQueryV2Options {
     pub active_time_sources: Vec<ActiveTimeSource>,
     #[serde(default)]
     pub capabilities: Vec<String>,
+    #[serde(default = "default_true")]
+    pub filter_afk: bool,
+    #[serde(default)]
+    pub filter_categories: Option<Vec<Vec<String>>>,
+    #[serde(default)]
+    pub explain_categories: bool,
+}
+
+impl Default for CanonicalQueryV2Options {
+    fn default() -> Self {
+        Self {
+            hostname: None,
+            category_specs: None,
+            activity_coverage_sources: Vec::new(),
+            context_sources: Vec::new(),
+            active_time_rule: None,
+            active_time_sources: Vec::new(),
+            capabilities: Vec::new(),
+            filter_afk: true,
+            filter_categories: None,
+            explain_categories: false,
+        }
+    }
 }
 
 /// Legacy compatibility options for mixing advanced sources into desktop/Android queries.
@@ -273,11 +346,14 @@ pub enum QueryParams {
 }
 
 impl QueryParams {
-    /// Build canonical events query string
+    /// Build canonical events through the current desktop pipeline.
+    ///
+    /// Android is an explicit legacy platform target and retains its frozen grammar.
     pub fn canonical_events(&self) -> String {
         match self {
             QueryParams::Desktop(params) => build_desktop_canonical_events(params),
-            QueryParams::Android(params) => build_android_canonical_events(params),
+            QueryParams::Android(params) => legacy_v1::android(params)
+                .expect("Android query parameters must be representable in Query2"),
         }
     }
 
@@ -294,9 +370,9 @@ impl QueryParams {
             QueryParams::Desktop(params) => {
                 try_build_desktop_canonical_events_with_options(params, options)
             }
-            QueryParams::Android(params) => {
-                try_build_android_canonical_events_with_options(params, options)
-            }
+            QueryParams::Android(_) => Err(
+                "Android grammar is legacy-v1 only; use queries::legacy_v1 explicitly".to_string(),
+            ),
         }
     }
 }
@@ -304,6 +380,158 @@ impl QueryParams {
 /// Serialize legacy classes using Query2's raw-backslash string grammar.
 fn serialize_classes(classes: &[ClassRule]) -> String {
     serialize_query_json(classes)
+}
+
+fn escape_regex_literal(value: &str) -> String {
+    let mut output = String::new();
+    for character in value.chars() {
+        if ".*+?^$()[]{}|\\".contains(character) {
+            output.push('\\');
+        }
+        output.push(character);
+    }
+    output
+}
+
+pub(crate) fn current_browser_families(
+    bucket_ids: &[String],
+) -> Vec<(
+    &'static str,
+    &'static [&'static str],
+    &'static str,
+    Vec<String>,
+)> {
+    CURRENT_BROWSER_FAMILIES
+        .iter()
+        .filter_map(|(family, names, pattern)| {
+            let family_buckets = bucket_ids
+                .iter()
+                .filter(|bucket_id| bucket_id.contains(family))
+                .cloned()
+                .collect::<Vec<_>>();
+            (!family_buckets.is_empty()).then_some((*family, *names, *pattern, family_buckets))
+        })
+        .collect()
+}
+
+pub(crate) fn current_browser_focus_rule(source_id: &str, family: &str) -> serde_json::Value {
+    let (_, exact_names, app_pattern) = CURRENT_BROWSER_FAMILIES
+        .iter()
+        .find(|(candidate, _, _)| *candidate == family)
+        .expect("browser family is registered");
+    let mut rules = Vec::new();
+    if !exact_names.is_empty() {
+        let names = exact_names
+            .iter()
+            .map(|name| escape_regex_literal(name))
+            .collect::<Vec<_>>()
+            .join("|");
+        rules.push(serde_json::json!({
+            "type":"regex", "source":source_id, "field":"app",
+            "regex":format!("^(?:{names})$")
+        }));
+    }
+    rules.push(serde_json::json!({
+        "type":"regex", "source":source_id, "field":"app", "regex":app_pattern
+    }));
+    if rules.len() == 1 {
+        rules.remove(0)
+    } else {
+        serde_json::json!({"type":"any", "rules":rules})
+    }
+}
+
+pub(crate) fn semantic_rule_expression(
+    expression: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let expression = expression
+        .as_object()
+        .ok_or_else(|| "rule expression must be an object".to_string())?;
+    let kind = expression
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| expression.contains_key("regex").then_some("regex"));
+    match kind {
+        Some("none") => Ok(serde_json::json!({"type":"none"})),
+        Some(kind @ ("all" | "any")) => {
+            let children = expression
+                .get("rules")
+                .or_else(|| expression.get("children"))
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| format!("{kind} rule requires child rules"))?;
+            Ok(serde_json::json!({
+                "type": kind,
+                "rules": children
+                    .iter()
+                    .map(semantic_rule_expression)
+                    .collect::<Result<Vec<_>, _>>()?
+            }))
+        }
+        Some("regex") => {
+            let mut result = serde_json::Map::new();
+            result.insert("type".to_string(), serde_json::json!("regex"));
+            result.insert(
+                "regex".to_string(),
+                expression
+                    .get("regex")
+                    .cloned()
+                    .ok_or_else(|| "regex rule requires regex".to_string())?,
+            );
+            for key in [
+                "source",
+                "host",
+                "ignore_case",
+                "negate",
+                "weight",
+                "value_mode",
+            ] {
+                if let Some(value) = expression.get(key) {
+                    result.insert(key.to_string(), value.clone());
+                }
+            }
+            for key in ["fields", "field", "select_keys"] {
+                if let Some(value) = expression.get(key) {
+                    result.insert(key.to_string(), value.clone());
+                    break;
+                }
+            }
+            Ok(serde_json::Value::Object(result))
+        }
+        kind => Err(format!("unsupported rule expression type {kind:?}")),
+    }
+}
+
+pub(crate) fn semantic_category_specs(
+    categories: &[serde_json::Value],
+) -> Result<Vec<serde_json::Value>, String> {
+    categories
+        .iter()
+        .map(|category| {
+            let category = category
+                .as_object()
+                .ok_or_else(|| "category spec must be an object".to_string())?;
+            let mut result = serde_json::Map::new();
+            for key in ["id", "name"] {
+                if let Some(value) = category.get(key) {
+                    result.insert(key.to_string(), value.clone());
+                }
+            }
+            result.insert(
+                "rule".to_string(),
+                semantic_rule_expression(
+                    category
+                        .get("rule")
+                        .ok_or_else(|| "category spec requires rule".to_string())?,
+                )?,
+            );
+            for key in ["priority", "set_priority", "requires"] {
+                if let Some(value) = category.get(key) {
+                    result.insert(key.to_string(), value.clone());
+                }
+            }
+            Ok(serde_json::Value::Object(result))
+        })
+        .collect()
 }
 
 fn serialize_query_json(value: &(impl Serialize + ?Sized)) -> String {
@@ -370,7 +598,19 @@ fn validate_query_strings(value: &(impl Serialize + ?Sized)) -> Result<(), Strin
 }
 
 fn validate_advanced_options(options: &AdvancedQueryOptions) -> Result<(), String> {
-    validate_query_strings(options)?;
+    validate_query_strings(&options.hostname)?;
+    validate_query_strings(&options.context_sources)?;
+    validate_query_strings(&options.active_time_sources)?;
+    validate_query_strings(&options.activity_coverage_sources)?;
+    validate_query_strings(&options.activity_sources)?;
+    validate_query_strings(&options.background_sources)?;
+    validate_query_strings(&options.legacy_window_fields)?;
+    if let Some(rule) = &options.active_time_rule {
+        validate_query_strings(&semantic_rule_expression(rule)?)?;
+    }
+    if let Some(categories) = &options.category_specs {
+        validate_query_strings(&semantic_category_specs(categories)?)?;
+    }
     if options.hostname.as_ref().is_some_and(String::is_empty) {
         return Err("hostname must be non-empty".to_string());
     }
@@ -422,10 +662,11 @@ fn validate_advanced_options(options: &AdvancedQueryOptions) -> Result<(), Strin
         if options.active_time_rule.is_none() {
             return Err("active-time sources require a rule".to_string());
         }
-        if options.active_time_sources.is_empty() {
-            return Err("active-time rules require at least one source".to_string());
-        }
         validate_active_time_sources(&options.active_time_sources, options.hostname.as_deref())?;
+        validate_active_time_rule_sources(
+            options.active_time_rule.as_ref().unwrap(),
+            &options.active_time_sources,
+        )?;
     }
     if !options.activity_sources.is_empty() {
         if !options
@@ -455,7 +696,17 @@ fn validate_advanced_options(options: &AdvancedQueryOptions) -> Result<(), Strin
 }
 
 fn validate_canonical_query_v2_options(options: &CanonicalQueryV2Options) -> Result<(), String> {
-    validate_query_strings(options)?;
+    validate_query_strings(&options.hostname)?;
+    validate_query_strings(&options.activity_coverage_sources)?;
+    validate_query_strings(&options.context_sources)?;
+    validate_query_strings(&options.active_time_sources)?;
+    validate_query_strings(&options.filter_categories)?;
+    if let Some(rule) = &options.active_time_rule {
+        validate_query_strings(&semantic_rule_expression(rule)?)?;
+    }
+    if let Some(categories) = &options.category_specs {
+        validate_query_strings(&semantic_category_specs(categories)?)?;
+    }
     if options.hostname.as_ref().is_some_and(String::is_empty) {
         return Err("hostname must be non-empty".to_string());
     }
@@ -515,10 +766,32 @@ fn validate_canonical_query_v2_options(options: &CanonicalQueryV2Options) -> Res
         if options.active_time_rule.is_none() {
             return Err("active-time sources require a rule".to_string());
         }
-        if options.active_time_sources.is_empty() {
-            return Err("active-time rules require at least one source".to_string());
-        }
         validate_active_time_sources(&options.active_time_sources, options.hostname.as_deref())?;
+        validate_active_time_rule_sources(
+            options.active_time_rule.as_ref().unwrap(),
+            &options.active_time_sources,
+        )?;
+    }
+    if options.explain_categories
+        && !options
+            .capabilities
+            .iter()
+            .any(|item| item == EXPLAIN_CATEGORIZE_V2_CAPABILITY)
+    {
+        return Err(format!(
+            "category explanations require server capability {EXPLAIN_CATEGORIZE_V2_CAPABILITY}"
+        ));
+    }
+    if options.filter_afk
+        && options.active_time_rule.is_none()
+        && !options
+            .activity_coverage_sources
+            .iter()
+            .any(|source| source.keeps_active)
+    {
+        return Err(
+            "active filtering requires an active-time rule or keeps_active coverage".to_string(),
+        );
     }
     Ok(())
 }
@@ -583,6 +856,9 @@ fn validate_active_time_sources(
         "active-time",
     )?;
     for source in sources {
+        if source.bucket_ids.is_empty() {
+            continue;
+        }
         resolve_source_buckets(
             source.scope,
             &source.bucket_ids,
@@ -593,6 +869,58 @@ fn validate_active_time_sources(
         )?;
     }
     Ok(())
+}
+
+fn validate_active_time_rule_sources(
+    rule: &serde_json::Value,
+    sources: &[ActiveTimeSource],
+) -> Result<(), String> {
+    fn collect(rule: &serde_json::Value, referenced: &mut std::collections::BTreeSet<String>) {
+        let rule_type = match rule.get("type") {
+            Some(serde_json::Value::String(rule_type)) => Some(rule_type.as_str()),
+            Some(serde_json::Value::Null) | None if rule.get("regex").is_some() => Some("regex"),
+            _ => None,
+        };
+        match rule_type {
+            Some("regex") => {
+                if let Some(source) = rule.get("source").and_then(serde_json::Value::as_str) {
+                    referenced.insert(source.to_string());
+                }
+            }
+            Some("all" | "any") => {
+                if let Some(children) = rule
+                    .get("rules")
+                    .or_else(|| rule.get("children"))
+                    .and_then(serde_json::Value::as_array)
+                {
+                    for child in children {
+                        collect(child, referenced);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let available = sources
+        .iter()
+        .map(|source| source.source_id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut referenced = std::collections::BTreeSet::new();
+    collect(rule, &mut referenced);
+    let missing = referenced
+        .iter()
+        .filter(|source| !available.contains(source.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "active-time rule references unknown source(s): {}",
+            missing.join(", ")
+        ))
+    }
 }
 
 fn validate_activity_coverage_sources(
@@ -776,481 +1104,638 @@ fn expected_source_hostname(
     }
 }
 
-fn build_context_events(
-    sources: &[ContextSource],
-    hostname: Option<&str>,
-    enforce_hostname: bool,
-) -> Result<String, String> {
-    let mut query = Vec::new();
-
-    for (index, source) in sources.iter().enumerate() {
-        let variable = format!("context_{index}");
-        query.push(format!("{variable} = []"));
-        for bucket_id in resolve_source_buckets(
-            source.scope,
-            &source.bucket_ids,
-            &source.bucket_hosts,
-            source.host.as_deref(),
-            hostname,
-            "context",
-        )? {
-            query.push(format!(
-                "{variable} = concat({variable}, flood(query_bucket_optional({}{})))",
-                serialize_bucket_id(bucket_id)?,
-                expected_source_hostname(source.scope, hostname, enforce_hostname)
-            ));
-        }
-        query.push(format!(
-            "{variable} = filter_period_intersect({variable}, events)"
-        ));
-        let options = serde_json::json!({
-            "source_id": source.source_id,
-            "conflict": source.conflict,
-        });
-        query.push(format!(
-            "context_fields_{index} = {}",
-            serialize_query_json(&source.fields)
-        ));
-        query.push(format!(
-            "context_options_{index} = {}",
-            serialize_query_json(&options)
-        ));
-        query.push(format!(
-            "events = merge_subwatcher_fields(events, {variable}, context_fields_{index}, context_options_{index})"
-        ));
-    }
-
-    Ok(query.join(";\n"))
+#[derive(Default)]
+struct CurrentPipelineInternals {
+    bucket_expressions: BTreeMap<String, Vec<String>>,
+    active_aliases: BTreeMap<String, String>,
+    auxiliary_sources: Vec<ActiveTimeSource>,
 }
 
-fn build_activity_coverage_events(
-    sources: &[ActivityCoverageSource],
+fn build_current_raw_source(
+    variable: &str,
+    bucket_ids: &[String],
+    bucket_hosts: &BTreeMap<String, String>,
+    host: Option<&str>,
+    scope: Option<SourceScope>,
+    policy: IntervalPolicy,
     hostname: Option<&str>,
-    enforce_hostname: bool,
+    source_kind: &str,
+    bucket_expressions: Option<&[String]>,
 ) -> Result<String, String> {
-    let mut query = Vec::new();
-
-    for (index, source) in sources.iter().enumerate() {
-        let variable = format!("activity_coverage_source_{index}");
-        query.push(format!("{variable} = []"));
-        for (bucket_index, bucket_id) in resolve_source_buckets(
-            source.scope,
-            &source.bucket_ids,
-            &source.bucket_hosts,
-            source.host.as_deref(),
-            hostname,
-            "activity coverage",
-        )?
-        .into_iter()
-        .enumerate()
-        {
-            let bucket_variable = format!("activity_coverage_bucket_{index}_{bucket_index}");
-            query.push(format!(
-                "{bucket_variable} = flood(query_bucket_optional({}{}))",
-                serialize_bucket_id(bucket_id)?,
-                expected_source_hostname(source.scope, hostname, enforce_hostname)
-            ));
-            query.push(format!(
-                "{variable} = union_no_overlap({variable}, {bucket_variable})"
-            ));
-        }
-        query.push(format!(
-            "activity_coverage_period_{index} = filter_period_intersect({variable}, {variable})"
-        ));
-        query.push(format!(
-            "events = period_union(events, activity_coverage_period_{index})"
-        ));
+    if bucket_ids.is_empty() && source_kind == "active-time" {
+        return Ok(format!("{variable}_raw = [];\n{variable} = {variable}_raw"));
     }
-
-    for (index, source) in sources.iter().enumerate() {
-        let variable = format!("activity_coverage_source_{index}");
-        query.push(format!(
-            "{variable} = filter_period_intersect({variable}, events)"
-        ));
-        query.push(format!(
-            "activity_coverage_fields_{index} = {}",
-            serialize_query_json(&source.fields)
-        ));
-        let options = serde_json::json!({
-            "source_id": source.source_id,
-            "conflict": "base_wins",
-        });
-        query.push(format!(
-            "activity_coverage_options_{index} = {}",
-            serialize_query_json(&options)
-        ));
-        query.push(format!(
-            "events = merge_subwatcher_fields(events, {variable}, activity_coverage_fields_{index}, activity_coverage_options_{index})"
-        ));
+    if bucket_expressions.is_some_and(|expressions| expressions.len() != bucket_ids.len()) {
+        return Err("internal bucket selector count does not match source bucket ids".to_string());
     }
-
-    Ok(query.join(";\n"))
-}
-
-fn build_activity_coverage_active_overrides(sources: &[ActivityCoverageSource]) -> String {
-    sources
+    let expression_by_id = bucket_ids
         .iter()
-        .enumerate()
-        .filter(|(_, source)| source.keeps_active)
-        .map(|(index, _)| {
-            format!("not_afk = period_union(not_afk, activity_coverage_period_{index})")
-        })
-        .collect::<Vec<_>>()
-        .join(";\n")
-}
-
-fn build_activity_events(
-    sources: &[ActivitySource],
-    filter_afk: bool,
-    hostname: Option<&str>,
-    enforce_hostname: bool,
-) -> Result<String, String> {
-    let mut query = Vec::new();
-
-    for (index, source) in sources.iter().enumerate() {
-        let variable = format!("activity_source_{index}");
-        query.push(format!("{variable} = []"));
-        for (bucket_index, bucket_id) in resolve_source_buckets(
-            source.scope,
-            &source.bucket_ids,
-            &source.bucket_hosts,
-            source.host.as_deref(),
-            hostname,
-            "activity",
-        )?
-        .into_iter()
-        .enumerate()
-        {
-            let bucket_variable = format!("activity_bucket_{index}_{bucket_index}");
-            query.push(format!(
-                "{bucket_variable} = flood(query_bucket_optional({}{}))",
-                serialize_bucket_id(bucket_id)?,
-                expected_source_hostname(source.scope, hostname, enforce_hostname)
-            ));
-            query.push(format!(
-                "{variable} = union_no_overlap({variable}, {bucket_variable})"
-            ));
+        .map(String::as_str)
+        .zip(bucket_expressions.unwrap_or_default())
+        .collect::<BTreeMap<_, _>>();
+    let mut query = vec![format!("{variable}_raw = []")];
+    for bucket_id in
+        resolve_source_buckets(scope, bucket_ids, bucket_hosts, host, hostname, source_kind)?
+    {
+        let first_argument = match expression_by_id.get(bucket_id) {
+            Some(expression) => (*expression).clone(),
+            None => serialize_bucket_id(bucket_id)?,
+        };
+        let mut arguments = vec![first_argument];
+        if scope != Some(SourceScope::Global) {
+            if let Some(hostname) = hostname {
+                arguments.push(serialize_query_json(hostname));
+            } else if policy == IntervalPolicy::Heartbeat {
+                arguments.push("null".to_string());
+            }
+        } else if policy == IntervalPolicy::Heartbeat {
+            arguments.push("null".to_string());
         }
-        if filter_afk {
-            query.push(format!(
-                "{variable} = filter_period_intersect({variable}, not_afk)"
-            ));
-        }
-        if !source.field_mappings.is_empty() {
-            query.push(format!(
-                "{variable} = map_event_fields({variable}, {})",
-                serialize_query_json(&source.field_mappings)
-            ));
-        }
-        query.push(format!("{variable} = sort_by_timestamp({variable})"));
-        query.push(format!("events = union_no_overlap({variable}, events)"));
-    }
-
-    Ok(query.join(";\n"))
-}
-
-fn build_background_events(
-    sources: &[ActivitySource],
-    hostname: Option<&str>,
-    enforce_hostname: bool,
-) -> Result<String, String> {
-    let mut query = Vec::new();
-
-    for (index, source) in sources.iter().enumerate() {
-        let variable = format!("background_source_{index}");
-        query.push(format!("{variable} = []"));
-        for (bucket_index, bucket_id) in resolve_source_buckets(
-            source.scope,
-            &source.bucket_ids,
-            &source.bucket_hosts,
-            source.host.as_deref(),
-            hostname,
-            "background activity",
-        )?
-        .into_iter()
-        .enumerate()
-        {
-            let bucket_variable = format!("background_bucket_{index}_{bucket_index}");
-            query.push(format!(
-                "{bucket_variable} = flood(query_bucket_optional({}{}))",
-                serialize_bucket_id(bucket_id)?,
-                expected_source_hostname(source.scope, hostname, enforce_hostname)
-            ));
-            query.push(format!(
-                "{variable} = union_no_overlap({variable}, {bucket_variable})"
-            ));
+        if policy == IntervalPolicy::Heartbeat {
+            arguments.push("5".to_string());
         }
         query.push(format!(
-            "{variable} = filter_period_intersect({variable}, not_afk)"
+            "{variable}_raw = concat({variable}_raw, query_bucket_optional_raw({}))",
+            arguments.join(", ")
         ));
-        if !source.field_mappings.is_empty() {
-            query.push(format!(
-                "{variable} = map_event_fields({variable}, {})",
-                serialize_query_json(&source.field_mappings)
-            ));
-        }
-        query.push(format!("{variable} = sort_by_timestamp({variable})"));
-        query.push(format!("events = union_no_overlap(events, {variable})"));
     }
-
+    query.push(match policy {
+        IntervalPolicy::Exact => format!("{variable} = {variable}_raw"),
+        IntervalPolicy::Heartbeat => format!("{variable} = flood_v2({variable}_raw)"),
+    });
     Ok(query.join(";\n"))
-}
-
-fn build_active_time_events(
-    sources: &[ActiveTimeSource],
-    active_time_rule: &serde_json::Value,
-    hostname: Option<&str>,
-    enforce_hostname: bool,
-) -> Result<String, String> {
-    let mut query = Vec::new();
-    let mut named_sources = Vec::with_capacity(sources.len());
-
-    for (index, source) in sources.iter().enumerate() {
-        let variable = format!("active_source_{index}");
-        query.push(format!("{variable} = []"));
-        for bucket_id in resolve_source_buckets(
-            source.scope,
-            &source.bucket_ids,
-            &source.bucket_hosts,
-            source.host.as_deref(),
-            hostname,
-            "active-time",
-        )? {
-            query.push(format!(
-                "{variable} = concat({variable}, flood(query_bucket_optional({}{})))",
-                serialize_bucket_id(bucket_id)?,
-                expected_source_hostname(source.scope, hostname, enforce_hostname)
-            ));
-        }
-        named_sources.push(format!(
-            "[{}, {variable}]",
-            serialize_query_json(&source.source_id)
-        ));
-    }
-
-    query.push(format!(
-        "active_time_rule = {}",
-        serialize_query_json(active_time_rule)
-    ));
-    query.push(format!(
-        "active_time_sources = [{}]",
-        named_sources.join(", ")
-    ));
-    query.push(format!(
-        "not_afk = active_periods_v2(active_time_sources, active_time_rule{})",
-        hostname
-            .map(|host| format!(", {}", serialize_query_json(host)))
-            .unwrap_or_default()
-    ));
-    query.push("not_afk = period_union(not_afk, [])".to_string());
-    Ok(query.join(";\n"))
-}
-
-fn append_enrichment_and_categorization(
-    query: &mut Vec<String>,
-    options: &AdvancedQueryOptions,
-) -> Result<bool, String> {
-    append_source_enrichment_and_categorization(
-        query,
-        options.hostname.as_deref(),
-        &options.context_sources,
-        options.category_specs.as_deref(),
-        &options.capabilities,
-    )
-}
-
-fn append_source_enrichment_and_categorization(
-    query: &mut Vec<String>,
-    hostname: Option<&str>,
-    context_sources: &[ContextSource],
-    category_specs: Option<&[serde_json::Value]>,
-    capabilities: &[String],
-) -> Result<bool, String> {
-    let enforce_hostname = capabilities
-        .iter()
-        .any(|capability| capability == OPTIONAL_BUCKET_HOSTNAME_CAPABILITY);
-    let context_events = build_context_events(context_sources, hostname, enforce_hostname)?;
-    if !context_events.is_empty() {
-        query.push(context_events);
-    }
-    if let Some(category_specs) = category_specs {
-        let host = hostname
-            .map(|host| format!(", {}", serialize_query_json(host)))
-            .unwrap_or_default();
-        query.push(format!(
-            "events = categorize_v2(events, {}{host});",
-            serialize_query_json(category_specs)
-        ));
-        return Ok(true);
-    }
-    Ok(false)
 }
 
 /// Build canonical events exclusively from explicit coverage, context, and active-time sources.
 ///
-/// Coverage contributes only periods plus namespaced `$source.<id>.<field>` facts. Context and
-/// active-time sources cannot create event periods.
+/// This is the sole current-server pipeline. Raw loads concatenate competing
+/// originals, coverage alone creates output periods, and the effective active
+/// mask is computed even when the caller requests unfiltered output.
 pub fn try_build_canonical_events_v2(options: &CanonicalQueryV2Options) -> Result<String, String> {
+    try_build_canonical_events_v2_internal(options, &CurrentPipelineInternals::default())
+}
+
+/// Add category totals to a canonical event program.
+pub fn category_totals_query(canonical_events: &str) -> String {
+    format!(
+        r#"{canonical_events}
+duration = sum_durations(events);
+cat_events = sort_by_duration(merge_events_by_keys(events, ["$category"]));
+RETURN = {{"duration": duration, "cat_events": cat_events}};"#
+    )
+}
+
+/// Add the active-duration result used by current-status consumers.
+pub fn active_status_query(canonical_events: &str) -> String {
+    format!(
+        r#"{canonical_events}
+duration = sum_durations(events);
+RETURN = {{"duration": duration}};"#
+    )
+}
+
+fn try_build_canonical_events_v2_internal(
+    options: &CanonicalQueryV2Options,
+    internals: &CurrentPipelineInternals,
+) -> Result<String, String> {
     validate_canonical_query_v2_options(options)?;
+    let hostname = options.hostname.as_deref();
+    let mut query = vec![
+        "query_window = query_period()".to_string(),
+        "coverage = []".to_string(),
+    ];
 
-    let mut query = vec!["events = []".to_string()];
-    let enforce_hostname = options
-        .capabilities
-        .iter()
-        .any(|capability| capability == OPTIONAL_BUCKET_HOSTNAME_CAPABILITY);
-    let coverage_events = build_activity_coverage_events(
-        &options.activity_coverage_sources,
-        options.hostname.as_deref(),
-        enforce_hostname,
-    )?;
-    if !coverage_events.is_empty() {
-        query.push(coverage_events);
-    }
-    if let Some(active_time_rule) = &options.active_time_rule {
-        query.push(build_active_time_events(
-            &options.active_time_sources,
-            active_time_rule,
-            options.hostname.as_deref(),
-            enforce_hostname,
+    for (index, source) in options.activity_coverage_sources.iter().enumerate() {
+        let variable = format!("coverage_source_{index}");
+        query.push(build_current_raw_source(
+            &variable,
+            &source.bucket_ids,
+            &source.bucket_hosts,
+            source.host.as_deref(),
+            source.scope,
+            source.interval_policy,
+            hostname,
+            "activity coverage",
+            internals
+                .bucket_expressions
+                .get(&source.source_id)
+                .map(Vec::as_slice),
         )?);
-        let active_overrides =
-            build_activity_coverage_active_overrides(&options.activity_coverage_sources);
-        if !active_overrides.is_empty() {
-            query.push(active_overrides);
+        query.push(format!(
+            "coverage_period_{index} = filter_period_intersect({variable}, query_window)"
+        ));
+        query.push(format!(
+            "coverage = period_union(coverage, coverage_period_{index})"
+        ));
+    }
+    for (index, source) in options.context_sources.iter().enumerate() {
+        query.push(build_current_raw_source(
+            &format!("context_source_{index}"),
+            &source.bucket_ids,
+            &source.bucket_hosts,
+            source.host.as_deref(),
+            source.scope,
+            source.interval_policy,
+            hostname,
+            "context",
+            internals
+                .bucket_expressions
+                .get(&source.source_id)
+                .map(Vec::as_slice),
+        )?);
+    }
+    for (index, source) in options.active_time_sources.iter().enumerate() {
+        let variable = format!("active_source_{index}");
+        if let Some(alias) = internals.active_aliases.get(&source.source_id) {
+            query.push(format!("{variable} = {alias}"));
+        } else {
+            query.push(build_current_raw_source(
+                &variable,
+                &source.bucket_ids,
+                &source.bucket_hosts,
+                source.host.as_deref(),
+                source.scope,
+                source.interval_policy,
+                hostname,
+                "active-time",
+                internals
+                    .bucket_expressions
+                    .get(&source.source_id)
+                    .map(Vec::as_slice),
+            )?);
         }
+    }
+    for (index, source) in internals.auxiliary_sources.iter().enumerate() {
+        query.push(build_current_raw_source(
+            &format!("auxiliary_source_{index}"),
+            &source.bucket_ids,
+            &source.bucket_hosts,
+            source.host.as_deref(),
+            source.scope,
+            source.interval_policy,
+            hostname,
+            "legacy auxiliary",
+            internals
+                .bucket_expressions
+                .get(&source.source_id)
+                .map(Vec::as_slice),
+        )?);
+    }
+
+    query.push("coverage = filter_period_intersect(coverage, query_window)".to_string());
+    query.push("events = coverage".to_string());
+    for (index, source) in options.activity_coverage_sources.iter().enumerate() {
+        let merge_options = serde_json::json!({
+            "source_id": source.source_id,
+            "conflict": "base_wins",
+        });
+        query.push(format!(
+            "events = merge_subwatcher_fields(events, coverage_source_{index}, {}, {})",
+            serialize_query_json(&source.fields),
+            serialize_query_json(&merge_options),
+        ));
+    }
+    for (index, source) in options.context_sources.iter().enumerate() {
+        let merge_options = serde_json::json!({
+            "source_id": source.source_id,
+            "conflict": source.conflict,
+        });
+        query.push(format!(
+            "events = merge_subwatcher_fields(events, context_source_{index}, {}, {})",
+            serialize_query_json(&source.fields),
+            serialize_query_json(&merge_options),
+        ));
+    }
+
+    if let Some(active_time_rule) = &options.active_time_rule {
+        let named = options
+            .active_time_sources
+            .iter()
+            .enumerate()
+            .map(|(index, source)| {
+                format!(
+                    "[{}, active_source_{index}]",
+                    serialize_query_json(&source.source_id)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        query.push(format!("active_time_sources = [{named}]"));
+        query.push(format!(
+            "active_time_rule = {}",
+            serialize_query_json(&semantic_rule_expression(active_time_rule)?)
+        ));
+        let host = hostname
+            .map(|value| format!(", {}", serialize_query_json(value)))
+            .unwrap_or_default();
+        query.push(format!(
+            "not_afk = active_periods_v2(active_time_sources, active_time_rule{host})"
+        ));
+    } else {
+        query.push("not_afk = []".to_string());
+    }
+    for (index, source) in options.activity_coverage_sources.iter().enumerate() {
+        if source.keeps_active {
+            query.push(format!(
+                "not_afk = period_union(not_afk, coverage_period_{index})"
+            ));
+        }
+    }
+    query.push("not_afk = period_union(not_afk, [])".to_string());
+    query.push("not_afk = filter_period_intersect(not_afk, coverage)".to_string());
+    if options.filter_afk {
         query.push("events = filter_period_intersect(events, not_afk)".to_string());
     }
-    append_source_enrichment_and_categorization(
-        &mut query,
-        options.hostname.as_deref(),
-        &options.context_sources,
-        options.category_specs.as_deref(),
-        &options.capabilities,
-    )?;
 
-    Ok(query.join(";\n"))
-}
-
-/// Build canonical events with legacy replacement/background source support.
-#[deprecated(
-    note = "replacement/background activity sources are not part of canonical v2; use try_build_canonical_events_v2"
-)]
-pub fn try_build_canonical_events(options: &AdvancedQueryOptions) -> Result<String, String> {
-    validate_advanced_options(options)?;
-    if !options.background_sources.is_empty() && options.active_time_rule.is_none() {
-        return Err("Background activity sources require an active-time rule".to_string());
+    if let Some(category_specs) = &options.category_specs {
+        let function = if options.explain_categories {
+            "categorize_v2_explain"
+        } else {
+            "categorize_v2"
+        };
+        let host = hostname
+            .map(|value| format!(", {}", serialize_query_json(value)))
+            .unwrap_or_default();
+        query.push(format!(
+            "events = {function}(events, {}{host})",
+            serialize_query_json(&semantic_category_specs(category_specs)?)
+        ));
     }
-
-    let mut query = vec!["events = []".to_string()];
-    let enforce_hostname = options
-        .capabilities
-        .iter()
-        .any(|capability| capability == OPTIONAL_BUCKET_HOSTNAME_CAPABILITY);
-    let coverage_events = build_activity_coverage_events(
-        &options.activity_coverage_sources,
-        options.hostname.as_deref(),
-        enforce_hostname,
-    )?;
-    if !coverage_events.is_empty() {
-        query.push(coverage_events);
-    }
-    let activity_events = build_activity_events(
-        &options.activity_sources,
-        false,
-        options.hostname.as_deref(),
-        enforce_hostname,
-    )?;
-    if !activity_events.is_empty() {
-        query.push(activity_events);
-    }
-    if let Some(active_time_rule) = &options.active_time_rule {
-        query.push(build_active_time_events(
-            &options.active_time_sources,
-            active_time_rule,
-            options.hostname.as_deref(),
-            enforce_hostname,
-        )?);
-        let active_overrides =
-            build_activity_coverage_active_overrides(&options.activity_coverage_sources);
-        if !active_overrides.is_empty() {
-            query.push(active_overrides);
+    if let Some(filter_categories) = &options.filter_categories {
+        if !filter_categories.is_empty() {
+            query.push(format!(
+                "events = filter_keyvals(events, \"$category\", {})",
+                serialize_query_json(filter_categories)
+            ));
         }
-        query.push("events = filter_period_intersect(events, not_afk)".to_string());
     }
-    let background_events = build_background_events(
-        &options.background_sources,
-        options.hostname.as_deref(),
-        enforce_hostname,
-    )?;
-    if !background_events.is_empty() {
-        query.push(background_events);
-    }
-    append_enrichment_and_categorization(&mut query, options)?;
-
-    Ok(query.join(";\n"))
-}
-
-/// Build a standalone query returning active periods from named sources and a rule.
-pub fn try_build_active_time_query(
-    sources: &[ActiveTimeSource],
-    active_time_rule: &serde_json::Value,
-    hostname: Option<&str>,
-) -> Result<String, String> {
-    try_build_active_time_query_with_capabilities(sources, active_time_rule, hostname, &[])
-}
-
-/// Build an active-time query with capability-gated server-side bucket ownership checks.
-pub fn try_build_active_time_query_with_capabilities(
-    sources: &[ActiveTimeSource],
-    active_time_rule: &serde_json::Value,
-    hostname: Option<&str>,
-    capabilities: &[String],
-) -> Result<String, String> {
-    if hostname.is_some_and(str::is_empty) {
-        return Err("hostname must be non-empty".to_string());
-    }
-    if sources.is_empty() {
-        return Err("active-time rules require at least one source".to_string());
-    }
-    validate_query_strings(sources)?;
-    validate_query_strings(active_time_rule)?;
-    validate_active_time_sources(sources, hostname)?;
-    let enforce_hostname = capabilities
-        .iter()
-        .any(|capability| capability == OPTIONAL_BUCKET_HOSTNAME_CAPABILITY);
-    Ok(format!(
-        "{};\nRETURN = not_afk;",
-        build_active_time_events(sources, active_time_rule, hostname, enforce_hostname)?
-    ))
-}
-
-fn build_legacy_afk_events(bid_afk: &str, hostname: Option<&str>) -> Result<String, String> {
-    if bid_afk.is_empty() {
-        return Err("legacy AFK bucket id must be non-empty".to_string());
-    }
-    if hostname.is_some_and(str::is_empty) {
-        return Err("hostname must be non-empty".to_string());
-    }
-    let host = hostname
-        .map(|host| format!(", {}", serialize_query_json(host)))
-        .unwrap_or_default();
-    Ok(format!(
-        "not_afk = flood(query_bucket(find_bucket({}{host})));\nnot_afk = filter_keyvals(not_afk, \"status\", [\"not-afk\"])",
-        serialize_bucket_id(bid_afk)?
-    ))
+    Ok(query.join(";\n") + ";")
 }
 
 /// Build a standalone legacy AFK query without requiring a window bucket.
 pub fn try_build_legacy_afk_query(bid_afk: &str, hostname: Option<&str>) -> Result<String, String> {
-    Ok(format!(
-        "{};\nRETURN = not_afk;",
-        build_legacy_afk_events(bid_afk, hostname)?
-    ))
+    legacy_v1::legacy_afk_query(bid_afk, hostname)
+}
+
+fn adapt_legacy_desktop_to_current_v2(
+    params: &DesktopQueryParams,
+    options: &AdvancedQueryOptions,
+) -> Result<String, String> {
+    validate_query_strings(params)?;
+    let default_classes;
+    let classes = if params.base.classes.is_empty() {
+        default_classes = crate::classes::default_classes();
+        default_classes.as_slice()
+    } else {
+        params.base.classes.as_slice()
+    };
+    if !options.activity_sources.is_empty() || !options.background_sources.is_empty() {
+        return Err("replacement/background source semantics are legacy-v1 only; use explicit coverage/context roles on current servers".to_string());
+    }
+    let mut coverage = options.activity_coverage_sources.clone();
+    let mut context = options.context_sources.clone();
+    let mut internals = CurrentPipelineInternals::default();
+    let mut projection_source = None;
+    let mut projection_variable = "events".to_string();
+    if options.legacy_window_mode == LegacyWindowMode::None
+        && params
+            .always_active_pattern
+            .as_deref()
+            .is_some_and(|pattern| !pattern.is_empty())
+    {
+        return Err("always_active_pattern requires a legacy window projection; legacy_window_mode=none is unsupported".to_string());
+    }
+    if !params.bid_window.is_empty() && options.legacy_window_mode != LegacyWindowMode::None {
+        let source_id = "legacy_window".to_string();
+        let window_bucket_id = params.bid_window.clone();
+        let mut selector_arguments = vec![serialize_bucket_id(&params.bid_window)?];
+        if let Some(hostname) = &options.hostname {
+            selector_arguments.push(serialize_query_json(hostname));
+        }
+        internals.bucket_expressions.insert(
+            source_id.clone(),
+            vec![format!("find_bucket({})", selector_arguments.join(", "))],
+        );
+        projection_source = Some(source_id.clone());
+        let scope = Some(if options.hostname.is_some() {
+            SourceScope::Host
+        } else {
+            SourceScope::Global
+        });
+        if options.legacy_window_mode == LegacyWindowMode::Activity {
+            projection_variable = "coverage_source_0".to_string();
+            coverage.insert(
+                0,
+                ActivityCoverageSource {
+                    source_id,
+                    bucket_ids: vec![window_bucket_id.clone()],
+                    fields: if options.legacy_window_fields.is_empty() {
+                        default_legacy_window_fields()
+                    } else {
+                        options.legacy_window_fields.clone()
+                    },
+                    keeps_active: false,
+                    scope,
+                    bucket_hosts: BTreeMap::new(),
+                    host: options.hostname.clone(),
+                    interval_policy: IntervalPolicy::Heartbeat,
+                },
+            );
+        } else {
+            projection_variable = "context_source_0".to_string();
+            context.insert(
+                0,
+                ContextSource {
+                    source_id,
+                    bucket_ids: vec![window_bucket_id.clone()],
+                    scope,
+                    bucket_hosts: BTreeMap::new(),
+                    fields: if options.legacy_window_fields.is_empty() {
+                        default_legacy_window_fields()
+                    } else {
+                        options.legacy_window_fields.clone()
+                    },
+                    conflict: "base_wins".to_string(),
+                    host: options.hostname.clone(),
+                    interval_policy: IntervalPolicy::Heartbeat,
+                },
+            );
+        }
+    }
+
+    let has_custom_active_rule = options.active_time_rule.is_some();
+    let mut active_rule = options.active_time_rule.clone();
+    let mut active_sources = options.active_time_sources.clone();
+    if active_rule.is_none() && !params.bid_afk.is_empty() {
+        active_sources = vec![ActiveTimeSource {
+            source_id: "legacy_afk".to_string(),
+            bucket_ids: vec![params.bid_afk.clone()],
+            scope: Some(if options.hostname.is_some() {
+                SourceScope::Host
+            } else {
+                SourceScope::Global
+            }),
+            bucket_hosts: BTreeMap::new(),
+            host: options.hostname.clone(),
+            interval_policy: IntervalPolicy::Heartbeat,
+        }];
+        let mut selector_arguments = vec![serialize_bucket_id(&params.bid_afk)?];
+        if let Some(hostname) = &options.hostname {
+            selector_arguments.push(serialize_query_json(hostname));
+        }
+        internals.bucket_expressions.insert(
+            "legacy_afk".to_string(),
+            vec![format!("find_bucket({})", selector_arguments.join(", "))],
+        );
+        let mut branches = vec![serde_json::json!({
+            "type":"regex", "source":"legacy_afk", "field":"status", "regex":"^not-afk$"
+        })];
+        if let (Some(pattern), Some(source_id)) = (
+            params.always_active_pattern.as_deref(),
+            projection_source.as_deref(),
+        ) {
+            active_sources.push(ActiveTimeSource {
+                source_id: source_id.to_string(),
+                bucket_ids: vec![params.bid_window.clone()],
+                scope: Some(if options.hostname.is_some() {
+                    SourceScope::Host
+                } else {
+                    SourceScope::Global
+                }),
+                bucket_hosts: BTreeMap::new(),
+                host: options.hostname.clone(),
+                interval_policy: IntervalPolicy::Heartbeat,
+            });
+            internals
+                .active_aliases
+                .insert(source_id.to_string(), projection_variable.clone());
+            branches.push(serde_json::json!({"type":"any", "rules":[
+                {"type":"regex", "source":source_id, "field":"app", "regex":pattern},
+                {"type":"regex", "source":source_id, "field":"title", "regex":pattern}
+            ]}));
+        }
+        active_rule = Some(if branches.len() == 1 {
+            branches.remove(0)
+        } else {
+            serde_json::json!({"type":"any", "rules":branches})
+        });
+    }
+
+    let mut browser_streams = Vec::<(String, String)>::new();
+    let audible_enabled = params.base.include_audible
+        && !has_custom_active_rule
+        && active_rule.is_some()
+        && projection_source.is_some();
+    let mut audible_rules = Vec::new();
+    for (browser_name, _app_names, _app_pattern, family_bucket_ids) in
+        current_browser_families(&params.base.bid_browsers)
+    {
+        let source_id = format!("legacy_browser_{browser_name}");
+        let source = ActiveTimeSource {
+            source_id: source_id.clone(),
+            bucket_ids: family_bucket_ids,
+            scope: Some(SourceScope::Global),
+            bucket_hosts: BTreeMap::new(),
+            host: None,
+            interval_policy: IntervalPolicy::Heartbeat,
+        };
+        if audible_enabled {
+            let active_index = active_sources.len();
+            active_sources.push(source);
+            browser_streams.push((
+                (*browser_name).to_string(),
+                format!("active_source_{active_index}"),
+            ));
+            audible_rules.push(serde_json::json!({
+                "type":"all",
+                "rules":[
+                    {"type":"regex", "source":source_id, "field":"audible", "regex":"^true$", "value_mode":"scalar"},
+                    current_browser_focus_rule(projection_source.as_deref().unwrap(), browser_name)
+                ]
+            }));
+        } else {
+            let auxiliary_index = internals.auxiliary_sources.len();
+            internals.auxiliary_sources.push(source);
+            browser_streams.push((
+                (*browser_name).to_string(),
+                format!("auxiliary_source_{auxiliary_index}"),
+            ));
+        }
+    }
+    if !audible_rules.is_empty() {
+        let focus_id = projection_source.as_ref().unwrap();
+        if !active_sources
+            .iter()
+            .any(|source| &source.source_id == focus_id)
+        {
+            active_sources.push(ActiveTimeSource {
+                source_id: focus_id.clone(),
+                bucket_ids: vec![params.bid_window.clone()],
+                scope: Some(if options.hostname.is_some() {
+                    SourceScope::Host
+                } else {
+                    SourceScope::Global
+                }),
+                bucket_hosts: BTreeMap::new(),
+                host: options.hostname.clone(),
+                interval_policy: IntervalPolicy::Heartbeat,
+            });
+            internals
+                .active_aliases
+                .insert(focus_id.clone(), projection_variable.clone());
+        }
+        let mut rules = vec![active_rule.take().unwrap()];
+        rules.extend(audible_rules);
+        active_rule = Some(serde_json::json!({"type":"any", "rules":rules}));
+    }
+
+    let canonical_options = CanonicalQueryV2Options {
+        hostname: options.hostname.clone(),
+        category_specs: None,
+        activity_coverage_sources: coverage,
+        context_sources: context,
+        active_time_rule: active_rule,
+        active_time_sources: active_sources,
+        capabilities: options.capabilities.clone(),
+        filter_afk: params.base.filter_afk,
+        filter_categories: None,
+        explain_categories: false,
+    };
+    let mut query = try_build_canonical_events_v2_internal(&canonical_options, &internals)?;
+    if projection_source.is_some() {
+        let fields = if options.legacy_window_fields.is_empty() {
+            default_legacy_window_fields()
+        } else {
+            options.legacy_window_fields.clone()
+        };
+        let source_variable = projection_variable.as_str();
+        query.push_str(&format!(
+            "\nevents = period_union([], events);\nevents = merge_subwatcher_fields(events, {source_variable}, {});",
+            serialize_query_json(&fields),
+        ));
+        let coverage_offset = usize::from(options.legacy_window_mode == LegacyWindowMode::Activity);
+        for (index, source) in options.activity_coverage_sources.iter().enumerate() {
+            let merge_options = serde_json::json!({
+                "source_id": source.source_id,
+                "conflict": "base_wins",
+            });
+            query.push_str(&format!(
+                "\nevents = merge_subwatcher_fields(events, coverage_source_{}, {}, {});",
+                index + coverage_offset,
+                serialize_query_json(&source.fields),
+                serialize_query_json(&merge_options),
+            ));
+        }
+        let context_offset = usize::from(options.legacy_window_mode == LegacyWindowMode::Context);
+        for (index, source) in options.context_sources.iter().enumerate() {
+            let merge_options = serde_json::json!({
+                "source_id": source.source_id,
+                "conflict": source.conflict,
+            });
+            query.push_str(&format!(
+                "\nevents = merge_subwatcher_fields(events, context_source_{}, {}, {});",
+                index + context_offset,
+                serialize_query_json(&source.fields),
+                serialize_query_json(&merge_options),
+            ));
+        }
+        if let Some(category_specs) = &options.category_specs {
+            let merge_options = serde_json::json!({
+                "source_id": projection_source.as_deref().unwrap(),
+                "conflict": "base_wins",
+            });
+            let host = options
+                .hostname
+                .as_ref()
+                .map(|hostname| format!(", {}", serialize_query_json(hostname)))
+                .unwrap_or_default();
+            query.push_str(&format!(
+                "\nevents = merge_subwatcher_fields(events, {source_variable}, {}, {});\nevents = categorize_v2(events, {}{host});",
+                serialize_query_json(&fields),
+                serialize_query_json(&merge_options),
+                serialize_query_json(&semantic_category_specs(category_specs)?),
+            ));
+        } else if !classes.is_empty() {
+            query.push_str(&format!(
+                "\nevents = categorize(events, {});",
+                serialize_classes(classes)
+            ));
+        }
+        if !params.base.filter_classes.is_empty() {
+            query.push_str(&format!(
+                "\nevents = filter_keyvals(events, \"$category\", {});",
+                serialize_query_json(&params.base.filter_classes)
+            ));
+        }
+    } else {
+        if let Some(category_specs) = &options.category_specs {
+            let host = options
+                .hostname
+                .as_ref()
+                .map(|hostname| format!(", {}", serialize_query_json(hostname)))
+                .unwrap_or_default();
+            query.push_str(&format!(
+                "\nevents = categorize_v2(events, {}{host});",
+                serialize_query_json(&semantic_category_specs(category_specs)?),
+            ));
+        } else if !classes.is_empty() {
+            query.push_str(&format!(
+                "\nevents = categorize(events, {});",
+                serialize_classes(classes)
+            ));
+        }
+        if !params.base.filter_classes.is_empty() {
+            query.push_str(&format!(
+                "\nevents = filter_keyvals(events, \"$category\", {});",
+                serialize_query_json(&params.base.filter_classes)
+            ));
+        }
+    }
+    query.push_str("\nbrowser_events = [];");
+    for (browser_name, variable) in browser_streams {
+        let Some(focus_id) = projection_source.as_ref() else {
+            continue;
+        };
+        let focus_rule = current_browser_focus_rule(focus_id, &browser_name);
+        let browser_fields = ["url", "title", "audible", "incognito", "tabCount"];
+        query.push_str(&format!(
+            "\nbrowser_focus_{browser_name} = active_periods_v2([[{}, {projection_variable}]], {});\nbrowser_facts_{browser_name} = merge_subwatcher_fields({variable}, [], {});\nbrowser_presence_{browser_name} = period_union({variable}, []);\nbrowser_presence_{browser_name} = filter_period_intersect(browser_presence_{browser_name}, browser_focus_{browser_name});\nbrowser_resolved_{browser_name} = merge_subwatcher_fields(browser_presence_{browser_name}, browser_facts_{browser_name}, {});\nbrowser_{browser_name} = split_url_events(browser_resolved_{browser_name});\nbrowser_events = concat(browser_events, browser_{browser_name});",
+            serialize_query_json(focus_id),
+            serialize_query_json(&focus_rule),
+            serialize_query_json(&browser_fields),
+            serialize_query_json(&browser_fields),
+        ));
+    }
+    if !params.base.bid_browsers.is_empty() {
+        // Derived report output cannot escape selected canonical activity.
+        query.push_str(
+            "\nbrowser_events = sort_by_timestamp(browser_events);\nbrowser_events = filter_period_intersect(browser_events, query_window);\nbrowser_events = filter_period_intersect(browser_events, events);",
+        );
+    }
+    Ok(query)
+}
+
+fn current_compatibility_options(options: &AdvancedQueryOptions) -> AdvancedQueryOptions {
+    let mut current = options.clone();
+    for capability in [
+        OPTIONAL_BUCKET_RAW_CAPABILITY,
+        QUERY_PERIOD_CAPABILITY,
+        FLOOD_V2_CAPABILITY,
+        CONTEXT_ENRICHMENT_CAPABILITY,
+        ACTIVE_PERIODS_V2_CAPABILITY,
+        CATEGORIZE_V2_CAPABILITY,
+    ] {
+        if !current.capabilities.iter().any(|item| item == capability) {
+            current.capabilities.push(capability.to_string());
+        }
+    }
+    current
 }
 
 pub fn build_desktop_canonical_events(params: &DesktopQueryParams) -> String {
-    build_desktop_canonical_events_with_options(params, &AdvancedQueryOptions::default())
-        .expect("legacy desktop query parameters are valid")
+    let options = current_compatibility_options(&AdvancedQueryOptions::default());
+    adapt_legacy_desktop_to_current_v2(params, &options)
+        .expect("desktop query parameters must be representable in Query2")
 }
 
 #[deprecated(
@@ -1261,162 +1746,9 @@ pub fn try_build_desktop_canonical_events_with_options(
     options: &AdvancedQueryOptions,
 ) -> Result<String, String> {
     validate_query_strings(params)?;
-    validate_advanced_options(options)?;
-    build_desktop_canonical_events_with_options(params, options)
-}
-
-fn build_desktop_canonical_events_with_options(
-    params: &DesktopQueryParams,
-    options: &AdvancedQueryOptions,
-) -> Result<String, String> {
-    let mut query = Vec::new();
-    let host = options
-        .hostname
-        .as_ref()
-        .map(|host| format!(", {}", serialize_query_json(host)))
-        .unwrap_or_default();
-
-    query.push("events = []".to_string());
-    let supports_source_namespace = options
-        .capabilities
-        .iter()
-        .any(|capability| capability == CONTEXT_ENRICHMENT_CAPABILITY);
-    let enforce_hostname = options
-        .capabilities
-        .iter()
-        .any(|capability| capability == OPTIONAL_BUCKET_HOSTNAME_CAPABILITY);
-    if !params.bid_window.is_empty() && options.legacy_window_mode != LegacyWindowMode::None {
-        query.push(format!(
-            "legacy_activity = flood(query_bucket(find_bucket({}{host})))",
-            serialize_bucket_id(&params.bid_window)?,
-        ));
-        if options.legacy_window_mode == LegacyWindowMode::Activity {
-            if supports_source_namespace {
-                query.push(
-                    "legacy_activity_period = filter_period_intersect(legacy_activity, legacy_activity)"
-                        .to_string(),
-                );
-                query.push("events = period_union(events, legacy_activity_period)".to_string());
-            } else {
-                query.push("events = legacy_activity".to_string());
-            }
-        }
-    }
-
-    let has_active_time_rule = options.active_time_rule.is_some();
-    let coverage_events = build_activity_coverage_events(
-        &options.activity_coverage_sources,
-        options.hostname.as_deref(),
-        enforce_hostname,
-    )?;
-    if !coverage_events.is_empty() {
-        query.push(coverage_events);
-    }
-    if !params.bid_window.is_empty()
-        && options.legacy_window_mode != LegacyWindowMode::None
-        && supports_source_namespace
-    {
-        let legacy_window_fields = if options.legacy_window_fields.is_empty() {
-            default_legacy_window_fields()
-        } else {
-            options.legacy_window_fields.clone()
-        };
-        query.push(format!(
-            "events = merge_subwatcher_fields(events, legacy_activity, {})",
-            serde_json::to_string(&legacy_window_fields).unwrap()
-        ));
-    }
-    let activity_events = build_activity_events(
-        &options.activity_sources,
-        false,
-        options.hostname.as_deref(),
-        enforce_hostname,
-    )?;
-    if !activity_events.is_empty() {
-        query.push(activity_events);
-    }
-
-    let needs_not_afk = params.base.filter_afk
-        || !options.background_sources.is_empty()
-        || options.active_time_rule.is_some();
-
-    // Fetch or compile not-afk events
-    if needs_not_afk {
-        if let Some(active_time_rule) = &options.active_time_rule {
-            query.push(build_active_time_events(
-                &options.active_time_sources,
-                active_time_rule,
-                options.hostname.as_deref(),
-                enforce_hostname,
-            )?);
-        } else {
-            let mut not_afk_query =
-                build_legacy_afk_events(&params.bid_afk, options.hostname.as_deref())?;
-
-            // Add treat_as_active functionality if pattern is provided
-            if let Some(ref pattern) = params.always_active_pattern {
-                let pattern = serialize_query_json(pattern);
-                not_afk_query.push_str(&format!(
-                    ";
-not_treat_as_afk = filter_keyvals_regex(events, \"app\", {});
-not_afk = period_union(not_afk, not_treat_as_afk);
-not_treat_as_afk = filter_keyvals_regex(events, \"title\", {});
-not_afk = period_union(not_afk, not_treat_as_afk)",
-                    pattern, pattern
-                ));
-            }
-
-            query.push(not_afk_query);
-        }
-    } else {
-        query.push("not_afk = []".to_string());
-    }
-
-    // Add browser events if any browser buckets specified
-    if !params.base.bid_browsers.is_empty() {
-        query.push(try_build_browser_events(params)?);
-
-        if params.base.include_audible && !has_active_time_rule && needs_not_afk {
-            query.push(
-                "audible_events = filter_keyvals(browser_events, \"audible\", [true]);
-not_afk = period_union(not_afk, audible_events)"
-                    .to_string(),
-            );
-        }
-    }
-
-    // Filter out window events when user was AFK
-    if params.base.filter_afk {
-        query.push("events = filter_period_intersect(events, not_afk)".to_string());
-    }
-
-    let background_events = build_background_events(
-        &options.background_sources,
-        options.hostname.as_deref(),
-        enforce_hostname,
-    )?;
-    if !background_events.is_empty() {
-        query.push(background_events);
-    }
-
-    // Enrich and categorize after AFK filtering.
-    let used_v2_categories = append_enrichment_and_categorization(&mut query, options)?;
-    if !used_v2_categories && !params.base.classes.is_empty() {
-        query.push(format!(
-            "events = categorize(events, {});",
-            serialize_classes(&params.base.classes)
-        ));
-    }
-
-    // Filter categories if specified
-    if !params.base.filter_classes.is_empty() {
-        query.push(format!(
-            "events = filter_keyvals(events, \"$category\", {})",
-            serialize_query_json(&params.base.filter_classes)
-        ));
-    }
-
-    Ok(query.join(";\n"))
+    let options = current_compatibility_options(options);
+    validate_advanced_options(&options)?;
+    adapt_legacy_desktop_to_current_v2(params, &options)
 }
 
 pub fn build_android_canonical_events(params: &AndroidQueryParams) -> String {
@@ -1453,61 +1785,11 @@ fn build_android_canonical_events_with_options(
     params: &AndroidQueryParams,
     options: &AdvancedQueryOptions,
 ) -> Result<String, String> {
-    let mut query = Vec::new();
-    let host = options
-        .hostname
-        .as_ref()
-        .map(|host| format!(", {}", serialize_query_json(host)))
-        .unwrap_or_default();
-
-    // Fetch app events
-    query.push(format!(
-        "events = flood(query_bucket(find_bucket({}{host})))",
-        serialize_bucket_id(&params.bid_android)?,
-    ));
-
-    // Preserve source intervals until report-level aggregation.
-    let used_v2_categories = append_enrichment_and_categorization(&mut query, options)?;
-    if !used_v2_categories && !params.base.classes.is_empty() {
-        query.push(format!(
-            "events = categorize(events, {});",
-            serialize_classes(&params.base.classes)
-        ));
-    }
-
-    // Filter categories if specified
-    if !params.base.filter_classes.is_empty() {
-        query.push(format!(
-            "events = filter_keyvals(events, \"$category\", {})",
-            serialize_query_json(&params.base.filter_classes)
-        ));
-    }
-
-    Ok(query.join(";\n"))
+    legacy_v1::android_with_options(params, options)
 }
 
 pub fn try_build_browser_events(params: &DesktopQueryParams) -> Result<String, String> {
-    let mut query = String::from("browser_events = [];");
-
-    for browser_bucket in &params.base.bid_browsers {
-        for (browser_name, app_names) in BROWSER_APPNAMES.entries() {
-            if browser_bucket.contains(browser_name) {
-                query.push_str(&format!(
-                    "
-events_{0} = flood(query_bucket({1}));
-window_{0} = filter_keyvals(events, \"app\", {2});
-events_{0} = filter_period_intersect(events_{0}, window_{0});
-events_{0} = split_url_events(events_{0});
-browser_events = concat(browser_events, events_{0});
-browser_events = sort_by_timestamp(browser_events)",
-                    browser_name,
-                    serialize_bucket_id(browser_bucket)?,
-                    serialize_query_json(app_names)
-                ));
-            }
-        }
-    }
-    Ok(query)
+    legacy_v1::browser_events(params)
 }
 
 pub fn build_browser_events(params: &DesktopQueryParams) -> String {
@@ -1535,7 +1817,6 @@ pub fn full_desktop_query(params: &DesktopQueryParams) -> String {
     if !params.base.bid_browsers.is_empty() {
         query.push_str(&format!(
             "
-            browser_events = split_url_events(browser_events);
             browser_urls = merge_events_by_keys(browser_events, [\"url\"]);
             browser_urls = sort_by_duration(browser_urls);
             browser_urls = limit_events(browser_urls, {});
@@ -1581,6 +1862,9 @@ pub fn full_desktop_query(params: &DesktopQueryParams) -> String {
     query
 }
 
+/// Explicit compatibility namespace for genuinely old server grammar.
+pub mod legacy_v1;
+
 fn serialize_bucket_id(bucket_id: &str) -> Result<String, String> {
     let trailing_backslashes = bucket_id
         .chars()
@@ -1597,26 +1881,6 @@ fn serialize_bucket_id(bucket_id: &str) -> Result<String, String> {
 #[allow(deprecated)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_desktop_query_generation() {
-        let params = DesktopQueryParams {
-            base: QueryParamsBase {
-                bid_browsers: vec![],
-                classes: vec![],
-                filter_classes: vec![],
-                filter_afk: true,
-                include_audible: true,
-            },
-            bid_window: "aw-watcher-window_".to_string(),
-            bid_afk: "aw-watcher-afk_".to_string(),
-            always_active_pattern: None,
-        };
-
-        let query = full_desktop_query(&params);
-        assert!(!query.is_empty());
-        assert!(query.contains("legacy_activity = flood"));
-    }
 
     #[test]
     fn test_desktop_query_without_afk_filter_returns_empty_active_events() {
@@ -1647,6 +1911,7 @@ mod tests {
                     spec_type: "regex".to_string(),
                     regex: "Google Docs".to_string(),
                     ignore_case: false,
+                    select_keys: Vec::new(),
                 },
             ),
             (
@@ -1655,6 +1920,7 @@ mod tests {
                     spec_type: "regex".to_string(),
                     regex: "GitHub|vim".to_string(),
                     ignore_case: true,
+                    select_keys: Vec::new(),
                 },
             ),
         ];
@@ -1708,29 +1974,6 @@ mod tests {
     }
 
     #[test]
-    fn test_canonical_events_with_empty_classes() {
-        let params = DesktopQueryParams {
-            base: QueryParamsBase {
-                bid_browsers: vec![],
-                classes: vec![],
-                filter_classes: vec![],
-                filter_afk: true,
-                include_audible: true,
-            },
-            bid_window: "test-window".to_string(),
-            bid_afk: "test-afk".to_string(),
-            always_active_pattern: None,
-        };
-
-        let query_params = QueryParams::Desktop(params);
-        let query = query_params.canonical_events();
-
-        // Should contain basic query structure
-        assert!(query.contains("legacy_activity = flood"));
-        assert!(query.contains("test-window"));
-    }
-
-    #[test]
     fn test_canonical_events_with_existing_classes() {
         let classes = vec![(
             vec!["Test".to_string()],
@@ -1738,6 +1981,7 @@ mod tests {
                 spec_type: "regex".to_string(),
                 regex: "test".to_string(),
                 ignore_case: false,
+                select_keys: Vec::new(),
             },
         )];
 
@@ -1763,84 +2007,6 @@ mod tests {
     }
 
     #[test]
-    fn test_context_enrichment_before_categorization() {
-        let params = DesktopQueryParams {
-            base: QueryParamsBase {
-                bid_browsers: vec![],
-                classes: vec![(
-                    vec!["Legacy".to_string()],
-                    crate::classes::CategorySpec {
-                        spec_type: "regex".to_string(),
-                        regex: "legacy".to_string(),
-                        ignore_case: false,
-                    },
-                )],
-                filter_classes: vec![],
-                filter_afk: true,
-                include_audible: true,
-            },
-            bid_window: "test-window".to_string(),
-            bid_afk: "test-afk".to_string(),
-            always_active_pattern: None,
-        };
-        let options = AdvancedQueryOptions {
-            hostname: Some("workstation".to_string()),
-            category_specs: Some(vec![serde_json::json!({
-                "name": ["Work"],
-                "rule": {
-                    "type": "regex",
-                    "field": "context.editor.project",
-                    "regex": "\\w+"
-                }
-            })]),
-            context_sources: vec![ContextSource {
-                source_id: "editor".to_string(),
-                bucket_ids: vec!["context-one".to_string(), "context-\"two".to_string()],
-                scope: Some(SourceScope::Global),
-                bucket_hosts: BTreeMap::new(),
-                fields: vec!["project".to_string()],
-                conflict: "base_wins".to_string(),
-                host: None,
-            }],
-            capabilities: vec![
-                CATEGORIZE_V2_CAPABILITY.to_string(),
-                CONTEXT_ENRICHMENT_CAPABILITY.to_string(),
-            ],
-            ..AdvancedQueryOptions::default()
-        };
-
-        let query = QueryParams::Desktop(params)
-            .try_canonical_events_with_options(&options)
-            .unwrap();
-        assert!(query.contains(
-            r#"legacy_activity = flood(query_bucket(find_bucket("test-window", "workstation")))"#
-        ));
-        assert!(query
-            .contains(r#"not_afk = flood(query_bucket(find_bucket("test-afk", "workstation")))"#));
-        assert!(query.contains(r#", "workstation");"#));
-        let afk_position = query
-            .find("events = filter_period_intersect(events, not_afk)")
-            .unwrap();
-        let context_position = query.find("context_0 = []").unwrap();
-        let categorize_position = query.find("events = categorize_v2").unwrap();
-
-        assert!(afk_position < context_position);
-        assert!(context_position < categorize_position);
-        assert!(query.contains(
-            "context_0 = concat(context_0, flood(query_bucket_optional(\"context-one\")))"
-        ));
-        assert!(query.contains("query_bucket_optional(\"context-\\\"two\")"));
-        assert!(query.contains("context_fields_0 = [\"project\"]"));
-        assert!(query
-            .contains("context_options_0 = {\"conflict\":\"base_wins\",\"source_id\":\"editor\"}"));
-        assert!(query.contains(
-            "events = merge_subwatcher_fields(events, context_0, context_fields_0, context_options_0)"
-        ));
-        assert!(query.contains("\"regex\":\"\\w+\""));
-        assert!(!query.contains("events = categorize(events"));
-    }
-
-    #[test]
     fn test_legacy_categorization_remains_default() {
         let params = AndroidQueryParams {
             base: QueryParamsBase {
@@ -1851,6 +2017,7 @@ mod tests {
                         spec_type: "regex".to_string(),
                         regex: "legacy".to_string(),
                         ignore_case: false,
+                        select_keys: Vec::new(),
                     },
                 )],
                 filter_classes: vec![],
@@ -1899,6 +2066,7 @@ mod tests {
                         spec_type: "regex".to_string(),
                         regex: "legacy".to_string(),
                         ignore_case: false,
+                        select_keys: Vec::new(),
                     },
                 )],
                 filter_classes: vec![],
@@ -1943,6 +2111,7 @@ mod tests {
                 fields,
                 conflict: "base_wins".to_string(),
                 host: None,
+                interval_policy: IntervalPolicy::Exact,
             };
 
         let options = |context_source| AdvancedQueryOptions {
@@ -1997,10 +2166,11 @@ mod tests {
             fields: vec!["url".to_string()],
             conflict: "base_wins".to_string(),
             host: None,
+            interval_policy: IntervalPolicy::Exact,
         };
 
         validate_context_sources(std::slice::from_ref(&source), Some("laptop")).unwrap();
-        let query = build_context_events(&[source], Some("laptop"), false).unwrap();
+        let query = legacy_v1::build_context_events(&[source], Some("laptop"), false).unwrap();
 
         assert!(query.contains("browser-laptop"));
         assert!(!query.contains("browser-desktop"));
@@ -2016,169 +2186,13 @@ mod tests {
             fields: vec!["url".to_string()],
             conflict: "base_wins".to_string(),
             host: None,
+            interval_policy: IntervalPolicy::Exact,
         };
 
         assert_eq!(
             validate_context_sources(&[source], Some("laptop")),
             Err("context source bucket_hosts must map every bucket exactly once".to_string())
         );
-    }
-
-    #[test]
-    fn test_categorize_v2_requires_capability() {
-        let params = AndroidQueryParams {
-            base: QueryParamsBase {
-                bid_browsers: vec![],
-                classes: vec![],
-                filter_classes: vec![],
-                filter_afk: true,
-                include_audible: true,
-            },
-            bid_android: "test-android".to_string(),
-        };
-        let options = AdvancedQueryOptions {
-            category_specs: Some(vec![serde_json::json!({"name": ["Work"]})]),
-            context_sources: vec![],
-            capabilities: vec![],
-            ..AdvancedQueryOptions::default()
-        };
-
-        assert_eq!(
-            QueryParams::Android(params).try_canonical_events_with_options(&options),
-            Err(format!(
-                "Flexible categorization requires server capability {CATEGORIZE_V2_CAPABILITY}"
-            ))
-        );
-    }
-
-    #[test]
-    fn test_context_enrichment_requires_capability() {
-        let params = AndroidQueryParams {
-            base: QueryParamsBase {
-                bid_browsers: vec![],
-                classes: vec![],
-                filter_classes: vec![],
-                filter_afk: true,
-                include_audible: true,
-            },
-            bid_android: "test-android".to_string(),
-        };
-        let options = AdvancedQueryOptions {
-            category_specs: None,
-            context_sources: vec![ContextSource {
-                source_id: "editor".to_string(),
-                bucket_ids: vec!["context".to_string()],
-                scope: Some(SourceScope::Global),
-                bucket_hosts: BTreeMap::new(),
-                fields: vec!["project".to_string()],
-                conflict: "base_wins".to_string(),
-                host: None,
-            }],
-            capabilities: vec![],
-            ..AdvancedQueryOptions::default()
-        };
-
-        assert_eq!(
-            QueryParams::Android(params).try_canonical_events_with_options(&options),
-            Err(format!(
-                "Context enrichment requires server capability {CONTEXT_ENRICHMENT_CAPABILITY}"
-            ))
-        );
-    }
-
-    #[test]
-    fn test_active_time_compilation_order_and_legacy_overrides() {
-        let params = DesktopQueryParams {
-            base: QueryParamsBase {
-                bid_browsers: vec!["aw-watcher-web-chrome".to_string()],
-                classes: vec![],
-                filter_classes: vec![],
-                filter_afk: true,
-                include_audible: true,
-            },
-            bid_window: "test-window".to_string(),
-            bid_afk: "legacy-afk".to_string(),
-            always_active_pattern: Some("always-active".to_string()),
-        };
-        let options = AdvancedQueryOptions {
-            hostname: Some("workstation".to_string()),
-            active_time_rule: Some(serde_json::json!({
-                "type": "regex",
-                "source": "afk",
-                "host": "workstation",
-                "field": "status",
-                "regex": "^not-afk$"
-            })),
-            active_time_sources: vec![
-                ActiveTimeSource {
-                    source_id: "afk".to_string(),
-                    bucket_ids: vec!["afk-one".to_string(), "afk-\"two".to_string()],
-                    scope: Some(SourceScope::Global),
-                    bucket_hosts: BTreeMap::new(),
-                    host: None,
-                },
-                ActiveTimeSource {
-                    source_id: "presence".to_string(),
-                    bucket_ids: vec!["presence".to_string()],
-                    scope: Some(SourceScope::Global),
-                    bucket_hosts: BTreeMap::new(),
-                    host: None,
-                },
-            ],
-            capabilities: vec![ACTIVE_PERIODS_V2_CAPABILITY.to_string()],
-            ..AdvancedQueryOptions::default()
-        };
-
-        let query = try_build_desktop_canonical_events_with_options(&params, &options).unwrap();
-        let source_position = query.find("active_source_0 = []").unwrap();
-        let rule_position = query.find("active_time_rule = {").unwrap();
-        let active_position = query.find("not_afk = active_periods_v2").unwrap();
-        let filter_position = query
-            .find("events = filter_period_intersect(events, not_afk)")
-            .unwrap();
-
-        assert!(source_position < rule_position);
-        assert!(rule_position < active_position);
-        assert!(active_position < filter_position);
-        assert!(query.contains(
-            "active_source_0 = concat(active_source_0, flood(query_bucket_optional(\"afk-one\")))"
-        ));
-        assert!(query.contains("query_bucket_optional(\"afk-\\\"two\")"));
-        assert!(query.contains(
-            "active_time_sources = [[\"afk\", active_source_0], [\"presence\", active_source_1]]"
-        ));
-        assert!(query.contains(
-            "not_afk = active_periods_v2(active_time_sources, active_time_rule, \"workstation\")"
-        ));
-        assert!(!query.contains("legacy-afk"));
-        assert!(!query.contains("always-active"));
-        assert!(!query.contains("audible_events"));
-    }
-
-    #[test]
-    fn test_active_time_default_leaves_legacy_query_unchanged() {
-        let params = DesktopQueryParams {
-            base: QueryParamsBase {
-                bid_browsers: vec!["aw-watcher-web-chrome".to_string()],
-                classes: vec![],
-                filter_classes: vec![],
-                filter_afk: true,
-                include_audible: true,
-            },
-            bid_window: "test-window".to_string(),
-            bid_afk: "legacy-afk".to_string(),
-            always_active_pattern: Some("always-active".to_string()),
-        };
-
-        let legacy = build_desktop_canonical_events(&params);
-        let advanced =
-            try_build_desktop_canonical_events_with_options(&params, &Default::default()).unwrap();
-
-        assert_eq!(advanced, legacy);
-        assert!(legacy.contains("legacy-afk"));
-        assert!(legacy.contains("always-active"));
-        assert!(legacy.contains("audible_events"));
-        assert!(!legacy.contains("active_periods_v2"));
     }
 
     #[test]
@@ -2191,6 +2205,7 @@ mod tests {
                 scope: Some(SourceScope::Global),
                 bucket_hosts: BTreeMap::new(),
                 host: None,
+                interval_policy: IntervalPolicy::Exact,
             }],
             ..AdvancedQueryOptions::default()
         };
@@ -2201,33 +2216,6 @@ mod tests {
                 "Active-time rules require server capability {ACTIVE_PERIODS_V2_CAPABILITY}"
             ))
         );
-    }
-
-    #[test]
-    fn test_active_time_source_validation() {
-        let options = |source_id: &str, bucket_ids: Vec<String>| AdvancedQueryOptions {
-            active_time_rule: Some(serde_json::json!({"type": "none"})),
-            active_time_sources: vec![ActiveTimeSource {
-                source_id: source_id.to_string(),
-                bucket_ids,
-                scope: Some(SourceScope::Global),
-                bucket_hosts: BTreeMap::new(),
-                host: None,
-            }],
-            capabilities: vec![ACTIVE_PERIODS_V2_CAPABILITY.to_string()],
-            ..AdvancedQueryOptions::default()
-        };
-
-        assert!(
-            validate_advanced_options(&options("invalid.source", vec!["afk".to_string()])).is_err()
-        );
-        assert!(validate_advanced_options(&options("afk", vec![])).is_err());
-        assert!(validate_advanced_options(&AdvancedQueryOptions {
-            active_time_rule: Some(serde_json::json!({"type": "none"})),
-            capabilities: vec![ACTIVE_PERIODS_V2_CAPABILITY.to_string()],
-            ..AdvancedQueryOptions::default()
-        })
-        .is_err());
     }
 
     #[test]
@@ -2249,6 +2237,7 @@ mod tests {
                 scope: Some(SourceScope::Global),
                 bucket_hosts: BTreeMap::new(),
                 host: None,
+                interval_policy: IntervalPolicy::Exact,
             }],
             ..AdvancedQueryOptions::default()
         };
@@ -2257,472 +2246,6 @@ mod tests {
             try_build_android_canonical_events_with_options(&params, &options),
             Err("Active-time options are not supported for Android queries".to_string())
         );
-    }
-
-    #[test]
-    fn test_activity_coverage_sources_build_abstract_stream() {
-        let options = AdvancedQueryOptions {
-            activity_coverage_sources: vec![
-                ActivityCoverageSource {
-                    source_id: "meeting".to_string(),
-                    bucket_ids: vec!["meeting".to_string()],
-                    fields: vec!["subject".to_string()],
-                    keeps_active: false,
-                    scope: Some(SourceScope::Global),
-                    bucket_hosts: BTreeMap::new(),
-                    host: None,
-                },
-                ActivityCoverageSource {
-                    source_id: "desktop".to_string(),
-                    bucket_ids: vec!["desktop".to_string()],
-                    fields: vec!["vdesktop".to_string()],
-                    keeps_active: false,
-                    scope: Some(SourceScope::Global),
-                    bucket_hosts: BTreeMap::new(),
-                    host: None,
-                },
-            ],
-            capabilities: vec![CONTEXT_ENRICHMENT_CAPABILITY.to_string()],
-            ..AdvancedQueryOptions::default()
-        };
-
-        let query = try_build_canonical_events(&options).unwrap();
-        assert!(query.contains("events = period_union(events, activity_coverage_period_0)"));
-        assert!(query.contains("events = period_union(events, activity_coverage_period_1)"));
-        assert!(query.contains(r#""source_id":"meeting""#));
-        assert!(query.contains(r#""source_id":"desktop""#));
-        assert!(!query.contains("events = union_no_overlap(activity_coverage_source_"));
-    }
-
-    #[test]
-    fn test_replacement_activity_sources_are_applied_in_order() {
-        let params = DesktopQueryParams {
-            base: QueryParamsBase {
-                bid_browsers: vec![],
-                classes: vec![],
-                filter_classes: vec![],
-                filter_afk: true,
-                include_audible: true,
-            },
-            bid_window: "test-window".to_string(),
-            bid_afk: "test-afk".to_string(),
-            always_active_pattern: None,
-        };
-        let options = AdvancedQueryOptions {
-            activity_sources: vec![
-                ActivitySource {
-                    source_id: "low".to_string(),
-                    bucket_ids: vec!["meeting-low".to_string()],
-                    scope: Some(SourceScope::Global),
-                    bucket_hosts: BTreeMap::new(),
-                    field_mappings: BTreeMap::new(),
-                    host: None,
-                },
-                ActivitySource {
-                    source_id: "high".to_string(),
-                    bucket_ids: vec!["meeting-high".to_string()],
-                    scope: Some(SourceScope::Global),
-                    bucket_hosts: BTreeMap::new(),
-                    field_mappings: BTreeMap::from([
-                        ("app".to_string(), "provider".to_string()),
-                        ("title".to_string(), "subject".to_string()),
-                    ]),
-                    host: None,
-                },
-            ],
-            capabilities: vec![MAP_EVENT_FIELDS_CAPABILITY.to_string()],
-            ..AdvancedQueryOptions::default()
-        };
-
-        let query = try_build_desktop_canonical_events_with_options(&params, &options).unwrap();
-        assert!(query.contains(
-            r#"map_event_fields(activity_source_1, {"app":"provider","title":"subject"})"#
-        ));
-        assert!(query.contains("activity_source_0 = sort_by_timestamp(activity_source_0)"));
-        assert!(query.contains("activity_source_1 = sort_by_timestamp(activity_source_1)"));
-        assert!(
-            query.find("union_no_overlap(activity_source_0").unwrap()
-                < query.find("union_no_overlap(activity_source_1").unwrap()
-        );
-    }
-
-    #[test]
-    fn test_replacement_activity_sources_are_sorted_without_afk_filtering() {
-        let params = DesktopQueryParams {
-            base: QueryParamsBase {
-                bid_browsers: vec![],
-                classes: vec![],
-                filter_classes: vec![],
-                filter_afk: false,
-                include_audible: false,
-            },
-            bid_window: "test-window".to_string(),
-            bid_afk: "test-afk".to_string(),
-            always_active_pattern: None,
-        };
-        let options = AdvancedQueryOptions {
-            activity_sources: vec![ActivitySource {
-                source_id: "replacement".to_string(),
-                bucket_ids: vec!["replacement".to_string()],
-                scope: Some(SourceScope::Global),
-                bucket_hosts: BTreeMap::new(),
-                field_mappings: BTreeMap::new(),
-                host: None,
-            }],
-            capabilities: vec![MAP_EVENT_FIELDS_CAPABILITY.to_string()],
-            ..AdvancedQueryOptions::default()
-        };
-
-        let query = try_build_desktop_canonical_events_with_options(&params, &options).unwrap();
-        let sort = query
-            .find("activity_source_0 = sort_by_timestamp(activity_source_0)")
-            .unwrap();
-        let union = query
-            .find("events = union_no_overlap(activity_source_0, events)")
-            .unwrap();
-        assert!(sort < union);
-        assert!(!query.contains("filter_period_intersect(activity_source_0, not_afk)"));
-    }
-
-    #[test]
-    fn test_background_query_generation_and_generic_active_rule_requirement() {
-        let options = AdvancedQueryOptions {
-            hostname: Some("workstation".to_string()),
-            category_specs: Some(vec![]),
-            context_sources: vec![ContextSource {
-                source_id: "editor".to_string(),
-                bucket_ids: vec!["editor".to_string()],
-                scope: Some(SourceScope::Global),
-                bucket_hosts: BTreeMap::new(),
-                fields: vec!["project".to_string()],
-                conflict: "base_wins".to_string(),
-                host: None,
-            }],
-            active_time_rule: Some(serde_json::json!({
-                "type": "regex",
-                "source": "presence",
-                "field": "state",
-                "regex": "^active$"
-            })),
-            active_time_sources: vec![ActiveTimeSource {
-                source_id: "presence".to_string(),
-                bucket_ids: vec!["presence".to_string()],
-                scope: Some(SourceScope::Global),
-                bucket_hosts: BTreeMap::new(),
-                host: None,
-            }],
-            activity_sources: vec![ActivitySource {
-                source_id: "replacement".to_string(),
-                bucket_ids: vec!["replacement".to_string()],
-                scope: Some(SourceScope::Global),
-                bucket_hosts: BTreeMap::new(),
-                field_mappings: BTreeMap::new(),
-                host: None,
-            }],
-            background_sources: vec![ActivitySource {
-                source_id: "calendar".to_string(),
-                bucket_ids: vec!["calendar-one".to_string(), "calendar-two".to_string()],
-                scope: Some(SourceScope::Global),
-                bucket_hosts: BTreeMap::new(),
-                field_mappings: BTreeMap::from([
-                    ("app".to_string(), "provider".to_string()),
-                    ("title".to_string(), "subject".to_string()),
-                ]),
-                host: None,
-            }],
-            capabilities: vec![
-                CATEGORIZE_V2_CAPABILITY.to_string(),
-                CONTEXT_ENRICHMENT_CAPABILITY.to_string(),
-                ACTIVE_PERIODS_V2_CAPABILITY.to_string(),
-                MAP_EVENT_FIELDS_CAPABILITY.to_string(),
-            ],
-            ..AdvancedQueryOptions::default()
-        };
-
-        let query = try_build_canonical_events(&options).unwrap();
-        let replacement = query.find("activity_source_0 = []").unwrap();
-        let active = query.find("not_afk = active_periods_v2").unwrap();
-        let mask = query
-            .find("events = filter_period_intersect(events, not_afk)")
-            .unwrap();
-        let background = query.find("background_source_0 = []").unwrap();
-        let context = query.find("context_0 = []").unwrap();
-        let categorize = query.find("events = categorize_v2").unwrap();
-        assert!(replacement < active);
-        assert!(active < mask);
-        assert!(mask < background);
-        assert!(background < context);
-        assert!(context < categorize);
-        assert!(query
-            .contains(r#"background_bucket_0_0 = flood(query_bucket_optional("calendar-one"))"#));
-        assert!(query.contains(
-            "background_source_0 = union_no_overlap(background_source_0, background_bucket_0_1)"
-        ));
-        assert!(query.contains(
-            "background_source_0 = filter_period_intersect(background_source_0, not_afk)"
-        ));
-        assert!(query.contains(
-            r#"map_event_fields(background_source_0, {"app":"provider","title":"subject"})"#
-        ));
-        assert!(query.contains("events = union_no_overlap(events, background_source_0)"));
-        assert!(!query.contains("find_bucket"));
-
-        let mut missing_rule = options;
-        missing_rule.active_time_rule = None;
-        missing_rule.active_time_sources.clear();
-        missing_rule
-            .capabilities
-            .retain(|capability| capability != ACTIVE_PERIODS_V2_CAPABILITY);
-        assert_eq!(
-            try_build_canonical_events(&missing_rule),
-            Err("Background activity sources require an active-time rule".to_string())
-        );
-    }
-
-    #[test]
-    fn test_desktop_background_uses_legacy_afk_even_without_activity_masking() {
-        let params = DesktopQueryParams {
-            base: QueryParamsBase {
-                bid_browsers: vec![],
-                classes: vec![],
-                filter_classes: vec![],
-                filter_afk: false,
-                include_audible: false,
-            },
-            bid_window: String::new(),
-            bid_afk: "legacy-afk".to_string(),
-            always_active_pattern: None,
-        };
-        let options = AdvancedQueryOptions {
-            background_sources: vec![ActivitySource {
-                source_id: "calendar".to_string(),
-                bucket_ids: vec!["calendar".to_string()],
-                scope: Some(SourceScope::Global),
-                bucket_hosts: BTreeMap::new(),
-                field_mappings: BTreeMap::new(),
-                host: None,
-            }],
-            capabilities: vec![MAP_EVENT_FIELDS_CAPABILITY.to_string()],
-            ..AdvancedQueryOptions::default()
-        };
-
-        let query = try_build_desktop_canonical_events_with_options(&params, &options).unwrap();
-        let afk = query.find(r#"find_bucket("legacy-afk")"#).unwrap();
-        let background = query.find("background_source_0 = []").unwrap();
-        assert!(afk < background);
-        assert!(!query.contains("legacy_activity"));
-        assert!(!query.contains("events = filter_period_intersect(events, not_afk)"));
-        assert!(query.contains(
-            "background_source_0 = filter_period_intersect(background_source_0, not_afk)"
-        ));
-    }
-
-    #[test]
-    fn test_background_execution_preserves_activity_merges_buckets_and_clips_to_active_time() {
-        let datastore = aw_datastore::Datastore::new_in_memory(false);
-        let timestamp = chrono::DateTime::parse_from_rfc3339("2024-06-01T12:00:00Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
-        for bucket_id in [
-            "replacement",
-            "presence",
-            "background-one",
-            "background-two",
-        ] {
-            datastore
-                .create_bucket(&aw_models::Bucket {
-                    bid: None,
-                    id: bucket_id.to_string(),
-                    _type: "test".to_string(),
-                    client: "test".to_string(),
-                    hostname: "test".to_string(),
-                    created: Some(timestamp),
-                    data: serde_json::Map::new(),
-                    metadata: aw_models::BucketMetadata::default(),
-                    events: None,
-                    last_updated: None,
-                })
-                .unwrap();
-        }
-        datastore
-            .insert_events(
-                "replacement",
-                &[aw_models::Event::new(
-                    timestamp,
-                    chrono::Duration::seconds(10),
-                    serde_json::Map::from_iter([(
-                        "app".to_string(),
-                        serde_json::json!("foreground"),
-                    )]),
-                )],
-            )
-            .unwrap();
-        datastore
-            .insert_events(
-                "presence",
-                &[aw_models::Event::new(
-                    timestamp,
-                    chrono::Duration::seconds(15),
-                    serde_json::Map::from_iter([(
-                        "state".to_string(),
-                        serde_json::json!("active"),
-                    )]),
-                )],
-            )
-            .unwrap();
-        for (bucket_id, app) in [
-            ("background-one", "background-first"),
-            ("background-two", "background-second"),
-        ] {
-            datastore
-                .insert_events(
-                    bucket_id,
-                    &[aw_models::Event::new(
-                        timestamp,
-                        chrono::Duration::seconds(20),
-                        serde_json::Map::from_iter([(
-                            "provider".to_string(),
-                            serde_json::json!(app),
-                        )]),
-                    )],
-                )
-                .unwrap();
-        }
-
-        let options = AdvancedQueryOptions {
-            active_time_rule: Some(serde_json::json!({
-                "type": "regex",
-                "source": "presence",
-                "field": "state",
-                "regex": "^active$"
-            })),
-            active_time_sources: vec![ActiveTimeSource {
-                source_id: "presence".to_string(),
-                bucket_ids: vec!["presence".to_string()],
-                scope: Some(SourceScope::Global),
-                bucket_hosts: BTreeMap::new(),
-                host: None,
-            }],
-            activity_sources: vec![ActivitySource {
-                source_id: "replacement".to_string(),
-                bucket_ids: vec!["replacement".to_string()],
-                scope: Some(SourceScope::Global),
-                bucket_hosts: BTreeMap::new(),
-                field_mappings: BTreeMap::new(),
-                host: None,
-            }],
-            background_sources: vec![ActivitySource {
-                source_id: "background".to_string(),
-                bucket_ids: vec![
-                    "background-one".to_string(),
-                    "background-two".to_string(),
-                    "missing-background".to_string(),
-                ],
-                scope: Some(SourceScope::Global),
-                bucket_hosts: BTreeMap::new(),
-                field_mappings: BTreeMap::from([("app".to_string(), "provider".to_string())]),
-                host: None,
-            }],
-            capabilities: vec![
-                ACTIVE_PERIODS_V2_CAPABILITY.to_string(),
-                MAP_EVENT_FIELDS_CAPABILITY.to_string(),
-            ],
-            ..AdvancedQueryOptions::default()
-        };
-
-        let query = try_build_canonical_events(&options).unwrap();
-        assert!(query.contains(r#"query_bucket_optional("missing-background")"#));
-        let interval =
-            aw_models::TimeInterval::new_from_string("2024-06-01T12:00:00Z/2024-06-01T12:01:00Z")
-                .unwrap();
-        let result =
-            aw_query::query(&format!("{query}; return events;"), &interval, &datastore).unwrap();
-        let events = Vec::<aw_models::Event>::try_from(&result).unwrap();
-
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0].data["app"], serde_json::json!("foreground"));
-        assert_eq!(events[0].duration, chrono::Duration::seconds(10));
-        assert_eq!(events[1].data["app"], serde_json::json!("background-first"));
-        assert_eq!(
-            events[1].timestamp,
-            timestamp + chrono::Duration::seconds(10)
-        );
-        assert_eq!(events[1].duration, chrono::Duration::seconds(5));
-    }
-
-    #[test]
-    fn test_background_host_mismatch_is_ignored_at_execution() {
-        let datastore = aw_datastore::Datastore::new_in_memory(false);
-        let timestamp = chrono::DateTime::parse_from_rfc3339("2024-06-01T12:00:00Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
-        datastore
-            .create_bucket(&aw_models::Bucket {
-                bid: None,
-                id: "presence".to_string(),
-                _type: "test".to_string(),
-                client: "test".to_string(),
-                hostname: "desktop".to_string(),
-                created: Some(timestamp),
-                data: serde_json::Map::new(),
-                metadata: aw_models::BucketMetadata::default(),
-                events: None,
-                last_updated: None,
-            })
-            .unwrap();
-        datastore
-            .insert_events(
-                "presence",
-                &[aw_models::Event::new(
-                    timestamp,
-                    chrono::Duration::seconds(10),
-                    serde_json::Map::from_iter([(
-                        "state".to_string(),
-                        serde_json::json!("active"),
-                    )]),
-                )],
-            )
-            .unwrap();
-        let options = AdvancedQueryOptions {
-            hostname: Some("desktop".to_string()),
-            active_time_rule: Some(serde_json::json!({
-                "type": "regex",
-                "source": "presence",
-                "field": "state",
-                "regex": "^active$"
-            })),
-            active_time_sources: vec![ActiveTimeSource {
-                source_id: "presence".to_string(),
-                bucket_ids: vec!["presence".to_string()],
-                scope: Some(SourceScope::Global),
-                bucket_hosts: BTreeMap::new(),
-                host: None,
-            }],
-            background_sources: vec![ActivitySource {
-                source_id: "laptop-calendar".to_string(),
-                bucket_ids: vec!["background-laptop".to_string()],
-                scope: Some(SourceScope::Host),
-                bucket_hosts: BTreeMap::new(),
-                field_mappings: BTreeMap::new(),
-                host: Some("laptop".to_string()),
-            }],
-            capabilities: vec![
-                ACTIVE_PERIODS_V2_CAPABILITY.to_string(),
-                MAP_EVENT_FIELDS_CAPABILITY.to_string(),
-            ],
-            ..AdvancedQueryOptions::default()
-        };
-
-        let query = try_build_canonical_events(&options).unwrap();
-        assert!(!query.contains("background-laptop"));
-        let interval =
-            aw_models::TimeInterval::new_from_string("2024-06-01T12:00:00Z/2024-06-01T12:01:00Z")
-                .unwrap();
-        let result =
-            aw_query::query(&format!("{query}; return events;"), &interval, &datastore).unwrap();
-        assert!(Vec::<aw_models::Event>::try_from(&result)
-            .unwrap()
-            .is_empty());
     }
 
     #[test]
@@ -2755,136 +2278,6 @@ mod tests {
         }))
         .unwrap();
         validate_context_sources(&[normalized_host], Some("laptop")).unwrap();
-    }
-
-    #[test]
-    fn test_shared_scope_resolver_isolates_roles_and_keeps_global_sources() {
-        let host_context = ContextSource {
-            source_id: "context_host".to_string(),
-            bucket_ids: vec!["context-laptop".to_string()],
-            scope: Some(SourceScope::Host),
-            bucket_hosts: BTreeMap::new(),
-            fields: vec!["project".to_string()],
-            conflict: "base_wins".to_string(),
-            host: Some("laptop".to_string()),
-        };
-        let global_context = ContextSource {
-            source_id: "context_global".to_string(),
-            bucket_ids: vec!["context-global".to_string()],
-            scope: Some(SourceScope::Global),
-            bucket_hosts: BTreeMap::new(),
-            fields: vec!["project".to_string()],
-            conflict: "base_wins".to_string(),
-            host: None,
-        };
-        let context_query =
-            build_context_events(&[host_context, global_context], Some("desktop"), false).unwrap();
-        assert!(!context_query.contains("context-laptop"));
-        assert!(context_query.contains("context-global"));
-
-        let active_query = try_build_active_time_query(
-            &[
-                ActiveTimeSource {
-                    source_id: "host".to_string(),
-                    bucket_ids: vec!["active-laptop".to_string()],
-                    scope: Some(SourceScope::Host),
-                    bucket_hosts: BTreeMap::new(),
-                    host: Some("laptop".to_string()),
-                },
-                ActiveTimeSource {
-                    source_id: "global".to_string(),
-                    bucket_ids: vec!["active-global".to_string()],
-                    scope: Some(SourceScope::Global),
-                    bucket_hosts: BTreeMap::new(),
-                    host: None,
-                },
-            ],
-            &serde_json::json!({"type": "none"}),
-            Some("desktop"),
-        )
-        .unwrap();
-        assert!(!active_query.contains("active-laptop"));
-        assert!(active_query.contains("active-global"));
-        assert!(active_query.contains(
-            r#"active_time_sources = [["host", active_source_0], ["global", active_source_1]]"#
-        ));
-    }
-
-    #[test]
-    fn test_host_scoped_sources_emit_server_hostname_check_when_supported() {
-        let options = AdvancedQueryOptions {
-            hostname: Some("laptop".to_string()),
-            capabilities: vec![
-                CONTEXT_ENRICHMENT_CAPABILITY.to_string(),
-                OPTIONAL_BUCKET_HOSTNAME_CAPABILITY.to_string(),
-            ],
-            context_sources: vec![
-                ContextSource {
-                    source_id: "host-context".to_string(),
-                    bucket_ids: vec!["context-laptop".to_string()],
-                    scope: Some(SourceScope::Host),
-                    bucket_hosts: BTreeMap::new(),
-                    fields: vec!["project".to_string()],
-                    conflict: "base_wins".to_string(),
-                    host: Some("laptop".to_string()),
-                },
-                ContextSource {
-                    source_id: "global-context".to_string(),
-                    bucket_ids: vec!["context-global".to_string()],
-                    scope: Some(SourceScope::Global),
-                    bucket_hosts: BTreeMap::new(),
-                    fields: vec!["project".to_string()],
-                    conflict: "base_wins".to_string(),
-                    host: None,
-                },
-            ],
-            ..AdvancedQueryOptions::default()
-        };
-
-        let query = try_build_canonical_events(&options).unwrap();
-        assert!(query.contains(r#"query_bucket_optional("context-laptop", "laptop")"#));
-        assert!(query.contains(r#"query_bucket_optional("context-global")"#));
-        let active_query = try_build_active_time_query_with_capabilities(
-            &[ActiveTimeSource {
-                source_id: "presence".to_string(),
-                bucket_ids: vec!["presence-laptop".to_string()],
-                scope: Some(SourceScope::Host),
-                bucket_hosts: BTreeMap::new(),
-                host: Some("laptop".to_string()),
-            }],
-            &serde_json::json!({"type": "none"}),
-            Some("laptop"),
-            &[OPTIONAL_BUCKET_HOSTNAME_CAPABILITY.to_string()],
-        )
-        .unwrap();
-        assert!(active_query.contains(r#"query_bucket_optional("presence-laptop", "laptop")"#));
-
-        let activity_query = try_build_canonical_events(&AdvancedQueryOptions {
-            hostname: Some("desktop".to_string()),
-            activity_sources: vec![
-                ActivitySource {
-                    source_id: "host".to_string(),
-                    bucket_ids: vec!["activity-laptop".to_string()],
-                    scope: Some(SourceScope::Host),
-                    bucket_hosts: BTreeMap::new(),
-                    field_mappings: BTreeMap::new(),
-                    host: Some("laptop".to_string()),
-                },
-                ActivitySource {
-                    source_id: "global".to_string(),
-                    bucket_ids: vec!["activity-global".to_string()],
-                    scope: Some(SourceScope::Global),
-                    bucket_hosts: BTreeMap::new(),
-                    field_mappings: BTreeMap::new(),
-                    host: None,
-                },
-            ],
-            capabilities: vec![MAP_EVENT_FIELDS_CAPABILITY.to_string()],
-            ..AdvancedQueryOptions::default()
-        })
-        .unwrap();
-        assert!(!activity_query.contains("activity-laptop"));
-        assert!(activity_query.contains("activity-global"));
     }
 
     #[test]
@@ -2981,330 +2374,7 @@ mod tests {
     }
 
     #[test]
-    fn test_duplicate_source_ids_rejected_for_every_role() {
-        let context = ContextSource {
-            source_id: "duplicate".to_string(),
-            bucket_ids: vec!["context".to_string()],
-            scope: Some(SourceScope::Global),
-            bucket_hosts: BTreeMap::new(),
-            fields: vec!["field".to_string()],
-            conflict: "base_wins".to_string(),
-            host: None,
-        };
-        assert!(validate_context_sources(&[context.clone(), context], None)
-            .unwrap_err()
-            .contains("duplicate context source id"));
-
-        let active = ActiveTimeSource {
-            source_id: "duplicate".to_string(),
-            bucket_ids: vec!["active".to_string()],
-            scope: Some(SourceScope::Global),
-            bucket_hosts: BTreeMap::new(),
-            host: None,
-        };
-        assert!(
-            validate_active_time_sources(&[active.clone(), active], None)
-                .unwrap_err()
-                .contains("duplicate active-time source id")
-        );
-
-        let activity = ActivitySource {
-            source_id: "duplicate".to_string(),
-            bucket_ids: vec!["activity".to_string()],
-            scope: Some(SourceScope::Global),
-            bucket_hosts: BTreeMap::new(),
-            field_mappings: BTreeMap::new(),
-            host: None,
-        };
-        assert!(
-            validate_activity_sources(&[activity.clone(), activity], None)
-                .unwrap_err()
-                .contains("duplicate activity source id")
-        );
-    }
-
-    #[test]
-    fn test_generic_expression_and_alternative_activity_need_no_window_or_afk() {
-        let expression_query = try_build_canonical_events(&AdvancedQueryOptions {
-            category_specs: Some(vec![serde_json::json!({
-                "name": ["Editor"],
-                "rule": {"type": "regex", "field": "title", "regex": "code"}
-            })]),
-            capabilities: vec![CATEGORIZE_V2_CAPABILITY.to_string()],
-            ..AdvancedQueryOptions::default()
-        })
-        .unwrap();
-        assert!(expression_query.starts_with("events = []"));
-        assert!(expression_query.contains("categorize_v2"));
-        assert!(!expression_query.contains("find_bucket"));
-        assert!(!expression_query.contains("not_afk"));
-
-        let activity_query = try_build_canonical_events(&AdvancedQueryOptions {
-            activity_sources: vec![ActivitySource {
-                source_id: "calendar".to_string(),
-                bucket_ids: vec!["calendar".to_string()],
-                scope: Some(SourceScope::Global),
-                bucket_hosts: BTreeMap::new(),
-                field_mappings: BTreeMap::new(),
-                host: None,
-            }],
-            capabilities: vec![MAP_EVENT_FIELDS_CAPABILITY.to_string()],
-            ..AdvancedQueryOptions::default()
-        })
-        .unwrap();
-        assert!(activity_query.starts_with("events = []"));
-        assert!(activity_query.contains("query_bucket_optional(\"calendar\")"));
-        assert!(!activity_query.contains("window"));
-        assert!(!activity_query.contains("not_afk"));
-    }
-
-    #[test]
-    fn test_generic_pipeline_uses_optional_buckets_and_executes_when_all_are_missing() {
-        let options = AdvancedQueryOptions {
-            category_specs: Some(vec![]),
-            context_sources: vec![ContextSource {
-                source_id: "editor".to_string(),
-                bucket_ids: vec!["missing-context".to_string()],
-                scope: Some(SourceScope::Global),
-                bucket_hosts: BTreeMap::new(),
-                fields: vec!["project".to_string()],
-                conflict: "base_wins".to_string(),
-                host: None,
-            }],
-            active_time_rule: Some(serde_json::json!({"type": "none"})),
-            active_time_sources: vec![ActiveTimeSource {
-                source_id: "presence".to_string(),
-                bucket_ids: vec!["missing-active".to_string()],
-                scope: Some(SourceScope::Global),
-                bucket_hosts: BTreeMap::new(),
-                host: None,
-            }],
-            activity_sources: vec![ActivitySource {
-                source_id: "activity".to_string(),
-                bucket_ids: vec!["missing-activity".to_string()],
-                scope: Some(SourceScope::Global),
-                bucket_hosts: BTreeMap::new(),
-                field_mappings: BTreeMap::new(),
-                host: None,
-            }],
-            capabilities: vec![
-                CATEGORIZE_V2_CAPABILITY.to_string(),
-                CONTEXT_ENRICHMENT_CAPABILITY.to_string(),
-                ACTIVE_PERIODS_V2_CAPABILITY.to_string(),
-                MAP_EVENT_FIELDS_CAPABILITY.to_string(),
-            ],
-            ..AdvancedQueryOptions::default()
-        };
-
-        let query = try_build_canonical_events(&options).unwrap();
-        assert_eq!(query.matches("query_bucket_optional").count(), 3);
-        assert!(!query.contains("query_bucket(\"missing"));
-
-        let datastore = aw_datastore::Datastore::new_in_memory(false);
-        let interval =
-            aw_models::TimeInterval::new_from_string("2024-01-01T00:00:00Z/2025-01-01T00:00:00Z")
-                .unwrap();
-        let result =
-            aw_query::query(&format!("{query}; return events;"), &interval, &datastore).unwrap();
-        assert!(Vec::<aw_models::Event>::try_from(&result)
-            .unwrap()
-            .is_empty());
-    }
-
-    #[test]
-    fn test_generic_pipeline_orders_and_executes_all_stages() {
-        let datastore = aw_datastore::Datastore::new_in_memory(false);
-        let timestamp = chrono::DateTime::parse_from_rfc3339("2024-06-01T12:00:00Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
-        for bucket_id in ["activity", "presence", "editor"] {
-            datastore
-                .create_bucket(&aw_models::Bucket {
-                    bid: None,
-                    id: bucket_id.to_string(),
-                    _type: "test".to_string(),
-                    client: "test".to_string(),
-                    hostname: "test".to_string(),
-                    created: Some(timestamp),
-                    data: serde_json::Map::new(),
-                    metadata: aw_models::BucketMetadata::default(),
-                    events: None,
-                    last_updated: None,
-                })
-                .unwrap();
-        }
-        datastore
-            .insert_events(
-                "activity",
-                &[aw_models::Event::new(
-                    timestamp,
-                    chrono::Duration::seconds(10),
-                    serde_json::Map::from_iter([
-                        ("app".to_string(), serde_json::json!("terminal")),
-                        ("title".to_string(), serde_json::json!("shell")),
-                    ]),
-                )],
-            )
-            .unwrap();
-        datastore
-            .insert_events(
-                "presence",
-                &[aw_models::Event::new(
-                    timestamp,
-                    chrono::Duration::seconds(10),
-                    serde_json::Map::from_iter([(
-                        "state".to_string(),
-                        serde_json::json!("active"),
-                    )]),
-                )],
-            )
-            .unwrap();
-        datastore
-            .insert_events(
-                "editor",
-                &[aw_models::Event::new(
-                    timestamp,
-                    chrono::Duration::seconds(10),
-                    serde_json::Map::from_iter([(
-                        "project".to_string(),
-                        serde_json::json!("activitywatch"),
-                    )]),
-                )],
-            )
-            .unwrap();
-
-        let options = AdvancedQueryOptions {
-            category_specs: Some(vec![serde_json::json!({
-                "name": ["Project"],
-                "rule": {
-                    "type": "regex",
-                    "source": "editor",
-                    "field": "project",
-                    "regex": "^activitywatch$"
-                }
-            })]),
-            context_sources: vec![ContextSource {
-                source_id: "editor".to_string(),
-                bucket_ids: vec!["editor".to_string()],
-                scope: Some(SourceScope::Global),
-                bucket_hosts: BTreeMap::new(),
-                fields: vec!["project".to_string()],
-                conflict: "base_wins".to_string(),
-                host: None,
-            }],
-            active_time_rule: Some(serde_json::json!({
-                "type": "regex",
-                "source": "presence",
-                "field": "state",
-                "regex": "^active$"
-            })),
-            active_time_sources: vec![ActiveTimeSource {
-                source_id: "presence".to_string(),
-                bucket_ids: vec!["presence".to_string()],
-                scope: Some(SourceScope::Global),
-                bucket_hosts: BTreeMap::new(),
-                host: None,
-            }],
-            activity_sources: vec![ActivitySource {
-                source_id: "activity".to_string(),
-                bucket_ids: vec!["activity".to_string()],
-                scope: Some(SourceScope::Global),
-                bucket_hosts: BTreeMap::new(),
-                field_mappings: BTreeMap::new(),
-                host: None,
-            }],
-            capabilities: vec![
-                CATEGORIZE_V2_CAPABILITY.to_string(),
-                CONTEXT_ENRICHMENT_CAPABILITY.to_string(),
-                ACTIVE_PERIODS_V2_CAPABILITY.to_string(),
-                MAP_EVENT_FIELDS_CAPABILITY.to_string(),
-            ],
-            ..AdvancedQueryOptions::default()
-        };
-
-        let query = try_build_canonical_events(&options).unwrap();
-        let activity_position = query.find("activity_source_0 = []").unwrap();
-        let active_position = query.find("active_source_0 = []").unwrap();
-        let mask_position = query
-            .find("events = filter_period_intersect(events, not_afk)")
-            .unwrap();
-        let context_position = query.find("context_0 = []").unwrap();
-        let category_position = query.find("events = categorize_v2").unwrap();
-        assert!(activity_position < active_position);
-        assert!(active_position < mask_position);
-        assert!(mask_position < context_position);
-        assert!(context_position < category_position);
-
-        let interval =
-            aw_models::TimeInterval::new_from_string("2024-01-01T00:00:00Z/2025-01-01T00:00:00Z")
-                .unwrap();
-        let result =
-            aw_query::query(&format!("{query}; return events;"), &interval, &datastore).unwrap();
-        let events = Vec::<aw_models::Event>::try_from(&result).unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].data["app"], serde_json::json!("terminal"));
-        assert_eq!(
-            events[0].data["$source.editor.project"],
-            serde_json::json!("activitywatch")
-        );
-        assert_eq!(events[0].data["$category"], serde_json::json!(["Project"]));
-    }
-
-    #[test]
-    fn test_context_app_and_title_are_ordinary_namespaced_fields() {
-        let query = try_build_canonical_events(&AdvancedQueryOptions {
-            category_specs: Some(vec![serde_json::json!({
-                "name": ["Context app"],
-                "rule": {
-                    "type": "regex",
-                    "source": "editor",
-                    "field": "app",
-                    "regex": "code"
-                }
-            })]),
-            context_sources: vec![ContextSource {
-                source_id: "editor".to_string(),
-                bucket_ids: vec!["editor".to_string()],
-                scope: Some(SourceScope::Global),
-                bucket_hosts: BTreeMap::new(),
-                fields: vec!["app".to_string(), "title".to_string()],
-                conflict: "base_wins".to_string(),
-                host: None,
-            }],
-            capabilities: vec![
-                CATEGORIZE_V2_CAPABILITY.to_string(),
-                CONTEXT_ENRICHMENT_CAPABILITY.to_string(),
-            ],
-            ..AdvancedQueryOptions::default()
-        })
-        .unwrap();
-
-        assert!(query.contains(r#"context_fields_0 = ["app","title"]"#));
-        assert!(query.contains(r#""source":"editor""#));
-        assert!(query.contains(r#""field":"app""#));
-        assert!(!query.contains("map_event_fields"));
-    }
-
-    #[test]
     fn test_active_and_legacy_afk_only_queries_need_no_activity_stream() {
-        let active_query = try_build_active_time_query(
-            &[ActiveTimeSource {
-                source_id: "afk".to_string(),
-                bucket_ids: vec!["afk-laptop".to_string()],
-                scope: Some(SourceScope::Host),
-                bucket_hosts: BTreeMap::new(),
-                host: Some("laptop".to_string()),
-            }],
-            &serde_json::json!({"type": "none"}),
-            Some("desktop"),
-        )
-        .unwrap();
-        assert!(active_query.contains("active_source_0 = []"));
-        assert!(active_query.ends_with("RETURN = not_afk;"));
-        assert!(active_query.contains(r#"active_time_sources = [["afk", active_source_0]]"#));
-        assert!(!active_query.contains("afk-laptop"));
-        assert!(!active_query.contains("events ="));
-
         let legacy_query = try_build_legacy_afk_query("legacy-afk", Some("desktop")).unwrap();
         assert!(legacy_query.contains(r#"find_bucket("legacy-afk", "desktop")"#));
         assert!(legacy_query.ends_with("RETURN = not_afk;"));
@@ -3359,6 +2429,88 @@ mod tests {
         Vec::<aw_models::Event>::try_from(&result).unwrap()
     }
 
+    #[test]
+    fn notifier_projection_queries_execute_category_totals_and_active_status() {
+        let datastore = aw_datastore::Datastore::new_in_memory(false);
+        let timestamp = chrono::DateTime::parse_from_rfc3339("2024-06-01T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        datastore
+            .create_bucket(&aw_models::Bucket {
+                bid: None,
+                id: "meeting".to_string(),
+                _type: "meeting".to_string(),
+                client: "test".to_string(),
+                hostname: "test".to_string(),
+                created: Some(timestamp),
+                data: serde_json::Map::new(),
+                metadata: aw_models::BucketMetadata::default(),
+                events: None,
+                last_updated: None,
+            })
+            .unwrap();
+        datastore
+            .insert_events(
+                "meeting",
+                &[aw_models::Event::new(
+                    timestamp,
+                    chrono::Duration::seconds(30),
+                    serde_json::Map::from_iter([(
+                        "subject".to_string(),
+                        serde_json::json!("Planning"),
+                    )]),
+                )],
+            )
+            .unwrap();
+        let source = global_coverage_source("meeting", "meeting", &["subject"]);
+        let options = CanonicalQueryV2Options {
+            activity_coverage_sources: vec![source],
+            active_time_sources: vec![ActiveTimeSource {
+                source_id: "meeting".to_string(),
+                bucket_ids: vec!["meeting".to_string()],
+                scope: Some(SourceScope::Global),
+                bucket_hosts: BTreeMap::new(),
+                host: None,
+                interval_policy: IntervalPolicy::Exact,
+            }],
+            active_time_rule: Some(serde_json::json!({
+                "type":"regex", "source":"meeting", "field":"subject", "regex":"Planning"
+            })),
+            category_specs: Some(vec![serde_json::json!({
+                "id":"meeting", "name":["Meeting"],
+                "rule":{"type":"regex", "source":"meeting", "field":"subject", "regex":"Planning"}
+            })]),
+            capabilities: vec![
+                OPTIONAL_BUCKET_RAW_CAPABILITY.to_string(),
+                QUERY_PERIOD_CAPABILITY.to_string(),
+                FLOOD_V2_CAPABILITY.to_string(),
+                CONTEXT_ENRICHMENT_CAPABILITY.to_string(),
+                ACTIVE_PERIODS_V2_CAPABILITY.to_string(),
+                CATEGORIZE_V2_CAPABILITY.to_string(),
+            ],
+            ..CanonicalQueryV2Options::default()
+        };
+        let canonical = try_build_canonical_events_v2(&options).unwrap();
+        let interval =
+            aw_models::TimeInterval::new_from_string("2024-06-01T12:00:00Z/2024-06-01T12:01:00Z")
+                .unwrap();
+
+        let totals =
+            aw_query::query(&category_totals_query(&canonical), &interval, &datastore).unwrap();
+        let totals = serde_json::to_value(totals).unwrap();
+        assert_eq!(totals["duration"], 30.0);
+        assert_eq!(totals["cat_events"][0]["duration"], 30.0);
+        assert_eq!(
+            totals["cat_events"][0]["data"]["$category"],
+            serde_json::json!(["Meeting"])
+        );
+
+        let status =
+            aw_query::query(&active_status_query(&canonical), &interval, &datastore).unwrap();
+        let status = serde_json::to_value(status).unwrap();
+        assert_eq!(status["duration"], 30.0);
+    }
+
     fn global_coverage_source(
         source_id: &str,
         bucket_id: &str,
@@ -3372,6 +2524,218 @@ mod tests {
             scope: Some(SourceScope::Global),
             bucket_hosts: BTreeMap::new(),
             host: None,
+            interval_policy: IntervalPolicy::Exact,
+        }
+    }
+
+    #[test]
+    fn test_combining_browser_family_buckets_before_projection_preserves_latest_event() {
+        let datastore = aw_datastore::Datastore::new_in_memory(false);
+        let timestamp = chrono::DateTime::parse_from_rfc3339("2024-06-01T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        for bucket_id in ["coverage", "browser-single", "browser-old", "browser-new"] {
+            datastore
+                .create_bucket(&aw_models::Bucket {
+                    bid: None,
+                    id: bucket_id.to_string(),
+                    _type: "test".to_string(),
+                    client: "test".to_string(),
+                    hostname: "test".to_string(),
+                    created: Some(timestamp),
+                    data: serde_json::Map::new(),
+                    metadata: aw_models::BucketMetadata::default(),
+                    events: None,
+                    last_updated: None,
+                })
+                .unwrap();
+        }
+        let event = |offset, duration, url: Option<&str>| {
+            aw_models::Event::new(
+                timestamp + chrono::Duration::seconds(offset),
+                chrono::Duration::seconds(duration),
+                serde_json::Map::from_iter([(
+                    if url.is_some() { "url" } else { "app" }.to_string(),
+                    serde_json::json!(url.unwrap_or("Chrome")),
+                )]),
+            )
+        };
+        datastore
+            .insert_events("coverage", &[event(30, 10, None)])
+            .unwrap();
+        datastore
+            .insert_events(
+                "browser-single",
+                &[
+                    event(0, 100, Some("https://old.example")),
+                    event(20, 40, Some("https://new.example")),
+                ],
+            )
+            .unwrap();
+        datastore
+            .insert_events("browser-old", &[event(0, 100, Some("https://old.example"))])
+            .unwrap();
+        datastore
+            .insert_events("browser-new", &[event(20, 40, Some("https://new.example"))])
+            .unwrap();
+        let interval =
+            aw_models::TimeInterval::new_from_string("2024-06-01T12:00:00Z/2024-06-01T12:02:00Z")
+                .unwrap();
+
+        for bucket_ids in [
+            vec!["browser-single"],
+            vec!["browser-old", "browser-new"],
+            vec!["browser-new", "browser-old"],
+        ] {
+            let loads = bucket_ids
+                .iter()
+                .map(|bucket_id| {
+                    format!("browser = concat(browser, flood(query_bucket(\"{bucket_id}\")));")
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let generated = format!(
+                "events = query_bucket(\"coverage\");\nbrowser = [];\n{loads}\nbrowser = sort_by_timestamp(browser);\nevents = merge_subwatcher_fields(events, browser, [\"url\"]);\nRETURN = events;"
+            );
+            let result = aw_query::query(&generated, &interval, &datastore).unwrap();
+            let events = Vec::<aw_models::Event>::try_from(&result).unwrap();
+            assert_eq!(events.len(), 1);
+            assert_eq!(
+                events[0].timestamp,
+                timestamp + chrono::Duration::seconds(30)
+            );
+            assert_eq!(events[0].duration, chrono::Duration::seconds(10));
+            assert_eq!(
+                events[0].data["url"],
+                serde_json::json!("https://new.example")
+            );
+        }
+    }
+
+    #[test]
+    fn test_context_enrichment_preserves_latest_overlapping_source_event() {
+        let datastore = aw_datastore::Datastore::new_in_memory(false);
+        let timestamp = chrono::DateTime::parse_from_rfc3339("2024-06-01T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        for bucket_id in ["overlap-coverage", "overlap-context"] {
+            datastore
+                .create_bucket(&aw_models::Bucket {
+                    bid: None,
+                    id: bucket_id.to_string(),
+                    _type: "test".to_string(),
+                    client: "test".to_string(),
+                    hostname: "test".to_string(),
+                    created: Some(timestamp),
+                    data: serde_json::Map::new(),
+                    metadata: aw_models::BucketMetadata::default(),
+                    events: None,
+                    last_updated: None,
+                })
+                .unwrap();
+        }
+        datastore
+            .insert_events(
+                "overlap-coverage",
+                &[aw_models::Event::new(
+                    timestamp + chrono::Duration::seconds(30),
+                    chrono::Duration::seconds(10),
+                    serde_json::Map::from_iter([("label".to_string(), serde_json::json!("base"))]),
+                )],
+            )
+            .unwrap();
+        datastore
+            .insert_events(
+                "overlap-context",
+                &[
+                    aw_models::Event::new(
+                        timestamp,
+                        chrono::Duration::seconds(100),
+                        serde_json::Map::from_iter([(
+                            "name".to_string(),
+                            serde_json::json!("older-long"),
+                        )]),
+                    ),
+                    aw_models::Event::new(
+                        timestamp + chrono::Duration::seconds(20),
+                        chrono::Duration::seconds(40),
+                        serde_json::Map::from_iter([(
+                            "name".to_string(),
+                            serde_json::json!("newer-short"),
+                        )]),
+                    ),
+                ],
+            )
+            .unwrap();
+
+        let coverage = global_coverage_source("coverage", "overlap-coverage", &["label"]);
+        let context = ContextSource {
+            source_id: "context".to_string(),
+            bucket_ids: vec!["overlap-context".to_string()],
+            scope: Some(SourceScope::Global),
+            bucket_hosts: BTreeMap::new(),
+            fields: vec!["name".to_string()],
+            conflict: "base_wins".to_string(),
+            host: None,
+            interval_policy: IntervalPolicy::Exact,
+        };
+        let capabilities = vec![CONTEXT_ENRICHMENT_CAPABILITY.to_string()];
+        let v2_query = try_build_canonical_events_v2(&CanonicalQueryV2Options {
+            activity_coverage_sources: vec![coverage.clone()],
+            context_sources: vec![context.clone()],
+            capabilities: capabilities.clone(),
+            filter_afk: false,
+            ..CanonicalQueryV2Options::default()
+        })
+        .unwrap();
+        let legacy_query = try_build_desktop_canonical_events_with_options(
+            &DesktopQueryParams {
+                base: QueryParamsBase {
+                    bid_browsers: vec![],
+                    classes: vec![],
+                    filter_classes: vec![],
+                    filter_afk: false,
+                    include_audible: false,
+                },
+                bid_window: String::new(),
+                bid_afk: String::new(),
+                always_active_pattern: None,
+            },
+            &AdvancedQueryOptions {
+                activity_coverage_sources: vec![coverage],
+                context_sources: vec![context],
+                capabilities,
+                ..AdvancedQueryOptions::default()
+            },
+        )
+        .unwrap();
+        let interval =
+            aw_models::TimeInterval::new_from_string("2024-06-01T12:00:00Z/2024-06-01T12:02:00Z")
+                .unwrap();
+
+        for generated in [v2_query, legacy_query] {
+            assert!(!generated.contains("context_0 = filter_period_intersect(context_0, events)"));
+            let result = aw_query::query(
+                &format!("{generated}; return events;"),
+                &interval,
+                &datastore,
+            )
+            .unwrap();
+            let events = Vec::<aw_models::Event>::try_from(&result).unwrap();
+            assert_eq!(events.len(), 1);
+            assert_eq!(
+                events[0].timestamp,
+                timestamp + chrono::Duration::seconds(30)
+            );
+            assert_eq!(events[0].duration, chrono::Duration::seconds(10));
+            assert_eq!(
+                events[0].data["$source.coverage.label"],
+                serde_json::json!("base")
+            );
+            assert_eq!(
+                events[0].data["$source.context.name"],
+                serde_json::json!("newer-short")
+            );
         }
     }
 
@@ -3390,12 +2754,13 @@ mod tests {
                 &["subject"],
             )],
             capabilities: vec![CONTEXT_ENRICHMENT_CAPABILITY.to_string()],
+            filter_afk: false,
             ..CanonicalQueryV2Options::default()
         };
 
         let query = try_build_canonical_events_v2(&options).unwrap();
         assert!(!query.contains("find_bucket"));
-        assert!(!query.contains("not_afk"));
+        assert!(query.contains("not_afk = filter_period_intersect(not_afk, coverage)"));
         let events = run_v2_query(&datastore, &options);
         assert_eq!(events.len(), 1);
         assert_eq!(
@@ -3420,6 +2785,7 @@ mod tests {
                 &["label"],
             )],
             capabilities: vec![CONTEXT_ENRICHMENT_CAPABILITY.to_string()],
+            filter_afk: false,
             ..CanonicalQueryV2Options::default()
         };
 
@@ -3455,6 +2821,7 @@ mod tests {
                 &["subject"],
             )],
             capabilities: vec![CONTEXT_ENRICHMENT_CAPABILITY.to_string()],
+            filter_afk: false,
             ..CanonicalQueryV2Options::default()
         };
 
@@ -3488,6 +2855,7 @@ mod tests {
                 &["app", "title"],
             )],
             capabilities: vec![CONTEXT_ENRICHMENT_CAPABILITY.to_string()],
+            filter_afk: false,
             ..CanonicalQueryV2Options::default()
         };
 
@@ -3523,6 +2891,7 @@ mod tests {
                 scope: Some(SourceScope::Global),
                 bucket_hosts: BTreeMap::new(),
                 host: None,
+                interval_policy: IntervalPolicy::Exact,
             }],
             capabilities: vec![
                 CONTEXT_ENRICHMENT_CAPABILITY.to_string(),
@@ -3533,12 +2902,14 @@ mod tests {
 
         let query = try_build_canonical_events_v2(&options).unwrap();
         let override_index = query
-            .find("not_afk = period_union(not_afk, activity_coverage_period_0)")
+            .find("not_afk = period_union(not_afk, coverage_period_0)")
             .unwrap();
+        let normalize_index = query.find("not_afk = period_union(not_afk, [])").unwrap();
         let mask_index = query
             .find("events = filter_period_intersect(events, not_afk)")
             .unwrap();
-        assert!(override_index < mask_index);
+        assert!(override_index < normalize_index);
+        assert!(normalize_index < mask_index);
     }
 
     #[test]
@@ -3567,8 +2938,10 @@ mod tests {
                 fields: vec!["project".to_string()],
                 conflict: "base_wins".to_string(),
                 host: None,
+                interval_policy: IntervalPolicy::Exact,
             }],
             capabilities: vec![CONTEXT_ENRICHMENT_CAPABILITY.to_string()],
+            filter_afk: false,
             ..CanonicalQueryV2Options::default()
         };
         assert!(run_v2_query(&datastore, &context_only).is_empty());
@@ -3586,6 +2959,7 @@ mod tests {
                 scope: Some(SourceScope::Global),
                 bucket_hosts: BTreeMap::new(),
                 host: None,
+                interval_policy: IntervalPolicy::Exact,
             }],
             capabilities: vec![ACTIVE_PERIODS_V2_CAPABILITY.to_string()],
             ..CanonicalQueryV2Options::default()
@@ -3617,10 +2991,382 @@ mod tests {
             );
         }
 
-        let query = try_build_canonical_events_v2(&CanonicalQueryV2Options::default()).unwrap();
-        assert_eq!(query, "events = []");
+        let query = try_build_canonical_events_v2(&CanonicalQueryV2Options {
+            filter_afk: false,
+            ..CanonicalQueryV2Options::default()
+        })
+        .unwrap();
+        assert!(query.contains("events = coverage"));
         assert!(!query.contains("find_bucket"));
         assert!(!query.contains("map_event_fields"));
+    }
+
+    #[test]
+    fn test_current_legacy_adapter_reuses_focused_browser_for_audible_activity() {
+        let datastore = aw_datastore::Datastore::new_in_memory(false);
+        let timestamp = chrono::DateTime::parse_from_rfc3339("2024-06-01T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        for (bucket_id, bucket_type) in [
+            ("aw-watcher-window_imported", "currentwindow"),
+            ("aw-watcher-afk_imported", "afkstatus"),
+            ("aw-watcher-web-chrome_imported", "web.tab.current"),
+        ] {
+            datastore
+                .create_bucket(&aw_models::Bucket {
+                    bid: None,
+                    id: bucket_id.to_string(),
+                    _type: bucket_type.to_string(),
+                    client: "test".to_string(),
+                    hostname: "host-a".to_string(),
+                    created: Some(timestamp),
+                    data: serde_json::Map::new(),
+                    metadata: aw_models::BucketMetadata::default(),
+                    events: None,
+                    last_updated: None,
+                })
+                .unwrap();
+        }
+        let event = |data| aw_models::Event::new(timestamp, chrono::Duration::seconds(20), data);
+        datastore
+            .insert_events(
+                "aw-watcher-window_imported",
+                &[event(serde_json::Map::from_iter([
+                    ("app".to_string(), serde_json::json!("Google Chrome")),
+                    ("title".to_string(), serde_json::json!("Focused")),
+                ]))],
+            )
+            .unwrap();
+        datastore
+            .insert_events(
+                "aw-watcher-afk_imported",
+                &[event(serde_json::Map::from_iter([(
+                    "status".to_string(),
+                    serde_json::json!("afk"),
+                )]))],
+            )
+            .unwrap();
+        datastore
+            .insert_events(
+                "aw-watcher-web-chrome_imported",
+                &[event(serde_json::Map::from_iter([
+                    ("url".to_string(), serde_json::json!("https://example.test")),
+                    ("title".to_string(), serde_json::json!("Page")),
+                    ("audible".to_string(), serde_json::json!(true)),
+                ]))],
+            )
+            .unwrap();
+
+        let params = DesktopQueryParams {
+            base: QueryParamsBase {
+                bid_browsers: vec!["aw-watcher-web-chrome_imported".to_string()],
+                classes: vec![],
+                filter_classes: vec![],
+                filter_afk: true,
+                include_audible: true,
+            },
+            bid_window: "aw-watcher-window_".to_string(),
+            bid_afk: "aw-watcher-afk_".to_string(),
+            always_active_pattern: None,
+        };
+        let options = AdvancedQueryOptions {
+            hostname: Some("host-a".to_string()),
+            capabilities: vec![
+                OPTIONAL_BUCKET_RAW_CAPABILITY.to_string(),
+                QUERY_PERIOD_CAPABILITY.to_string(),
+                FLOOD_V2_CAPABILITY.to_string(),
+                CONTEXT_ENRICHMENT_CAPABILITY.to_string(),
+                ACTIVE_PERIODS_V2_CAPABILITY.to_string(),
+                CATEGORIZE_V2_CAPABILITY.to_string(),
+            ],
+            ..AdvancedQueryOptions::default()
+        };
+        let generated = adapt_legacy_desktop_to_current_v2(&params, &options).unwrap();
+        assert!(generated.contains(
+            "query_bucket_optional_raw(find_bucket(\"aw-watcher-window_\", \"host-a\"), \"host-a\", 5)"
+        ));
+        assert!(generated.contains(
+            "query_bucket_optional_raw(find_bucket(\"aw-watcher-afk_\", \"host-a\"), \"host-a\", 5)"
+        ));
+        assert_eq!(
+            generated
+                .matches("query_bucket_optional_raw(\"aw-watcher-web-chrome_imported\"")
+                .count(),
+            1
+        );
+        let interval =
+            aw_models::TimeInterval::new_from_string("2024-06-01T12:00:00Z/2024-06-01T12:00:20Z")
+                .unwrap();
+        for variable in ["events", "browser_events"] {
+            let result = aw_query::query(
+                &format!("{generated}; return {variable};"),
+                &interval,
+                &datastore,
+            )
+            .unwrap();
+            let events = Vec::<aw_models::Event>::try_from(&result).unwrap();
+            assert_eq!(events.len(), 1, "{variable} should retain audible activity");
+        }
+
+        let mut without_audible = params.clone();
+        without_audible.base.include_audible = false;
+        let generated = adapt_legacy_desktop_to_current_v2(&without_audible, &options).unwrap();
+        let result = aw_query::query(
+            &format!("{generated}; return events;"),
+            &interval,
+            &datastore,
+        )
+        .unwrap();
+        assert!(Vec::<aw_models::Event>::try_from(&result)
+            .unwrap()
+            .is_empty());
+        let result = aw_query::query(
+            &format!("{generated}; return browser_events;"),
+            &interval,
+            &datastore,
+        )
+        .unwrap();
+        assert!(Vec::<aw_models::Event>::try_from(&result)
+            .unwrap()
+            .is_empty());
+
+        let mut custom_options = options.clone();
+        custom_options.active_time_rule = Some(serde_json::json!({"type": "none"}));
+        let generated = adapt_legacy_desktop_to_current_v2(&params, &custom_options).unwrap();
+        assert!(!generated.contains("\"field\":\"audible\""));
+        assert!(generated.contains("browser_chrome = split_url_events(browser_resolved_chrome)"));
+        assert!(!generated.contains("active_source_0 = filter_period_intersect"));
+
+        for bucket_id in ["aw-watcher-web-chrome-a", "aw-watcher-web-chrome-z"] {
+            datastore
+                .create_bucket(&aw_models::Bucket {
+                    bid: None,
+                    id: bucket_id.to_string(),
+                    _type: "web.tab.current".to_string(),
+                    client: "test".to_string(),
+                    hostname: "host-a".to_string(),
+                    created: Some(timestamp),
+                    data: serde_json::Map::new(),
+                    metadata: aw_models::BucketMetadata::default(),
+                    events: None,
+                    last_updated: None,
+                })
+                .unwrap();
+        }
+        datastore
+            .insert_events(
+                "aw-watcher-web-chrome-a",
+                &[event(serde_json::Map::from_iter([(
+                    "audible".to_string(),
+                    serde_json::json!(true),
+                )]))],
+            )
+            .unwrap();
+        datastore
+            .insert_events(
+                "aw-watcher-web-chrome-z",
+                &[event(serde_json::Map::from_iter([(
+                    "audible".to_string(),
+                    serde_json::json!(false),
+                )]))],
+            )
+            .unwrap();
+        let mut family_params = params.clone();
+        family_params.base.bid_browsers = vec![
+            "aw-watcher-web-chrome-a".to_string(),
+            "aw-watcher-web-chrome-z".to_string(),
+        ];
+        let generated = adapt_legacy_desktop_to_current_v2(&family_params, &options).unwrap();
+        assert_eq!(generated.matches("active_source_1_raw = concat").count(), 2);
+        let result = aw_query::query(
+            &format!("{generated}; return events;"),
+            &interval,
+            &datastore,
+        )
+        .unwrap();
+        assert!(Vec::<aw_models::Event>::try_from(&result)
+            .unwrap()
+            .is_empty());
+
+        let mut missing_params = params.clone();
+        missing_params.base.include_audible = false;
+        missing_params.base.bid_browsers = vec!["aw-watcher-web-chrome-missing".to_string()];
+        let generated = adapt_legacy_desktop_to_current_v2(&missing_params, &options).unwrap();
+        let result = aw_query::query(
+            &format!("{generated}; return browser_events;"),
+            &interval,
+            &datastore,
+        )
+        .unwrap();
+        assert!(Vec::<aw_models::Event>::try_from(&result)
+            .unwrap()
+            .is_empty());
+
+        datastore
+            .create_bucket(&aw_models::Bucket {
+                bid: None,
+                id: "meeting".to_string(),
+                _type: "meeting".to_string(),
+                client: "test".to_string(),
+                hostname: "host-a".to_string(),
+                created: Some(timestamp),
+                data: serde_json::Map::new(),
+                metadata: aw_models::BucketMetadata::default(),
+                events: None,
+                last_updated: None,
+            })
+            .unwrap();
+        datastore
+            .insert_events(
+                "meeting",
+                &[aw_models::Event::new(
+                    timestamp + chrono::Duration::seconds(5),
+                    chrono::Duration::seconds(5),
+                    serde_json::Map::from_iter([(
+                        "subject".to_string(),
+                        serde_json::json!("Planning"),
+                    )]),
+                )],
+            )
+            .unwrap();
+        let mut context_options = options.clone();
+        context_options.legacy_window_mode = LegacyWindowMode::Context;
+        context_options.activity_coverage_sources = vec![ActivityCoverageSource {
+            source_id: "meeting".to_string(),
+            bucket_ids: vec!["meeting".to_string()],
+            fields: vec!["subject".to_string()],
+            keeps_active: true,
+            scope: Some(SourceScope::Global),
+            bucket_hosts: BTreeMap::new(),
+            host: None,
+            interval_policy: IntervalPolicy::Exact,
+        }];
+        let generated = adapt_legacy_desktop_to_current_v2(&params, &context_options).unwrap();
+        for variable in ["events", "browser_events"] {
+            let result = aw_query::query(
+                &format!("{generated}; return {variable};"),
+                &interval,
+                &datastore,
+            )
+            .unwrap();
+            let events = Vec::<aw_models::Event>::try_from(&result).unwrap();
+            assert_eq!(events.len(), 1, "{variable}");
+            assert_eq!(events[0].duration, chrono::Duration::seconds(5));
+        }
+    }
+
+    #[test]
+    fn test_current_legacy_adapter_classifies_windowless_coverage_and_restores_namespaces() {
+        let capabilities = vec![
+            OPTIONAL_BUCKET_RAW_CAPABILITY.to_string(),
+            QUERY_PERIOD_CAPABILITY.to_string(),
+            FLOOD_V2_CAPABILITY.to_string(),
+            CONTEXT_ENRICHMENT_CAPABILITY.to_string(),
+            ACTIVE_PERIODS_V2_CAPABILITY.to_string(),
+            CATEGORIZE_V2_CAPABILITY.to_string(),
+        ];
+        let meeting = global_coverage_source("meeting", "meeting-imported", &["project"]);
+        let options = AdvancedQueryOptions {
+            hostname: Some("host-a".to_string()),
+            category_specs: Some(vec![serde_json::json!({
+                "id": "work",
+                "name": ["Work"],
+                "rule": {
+                    "type": "regex",
+                    "source": "meeting",
+                    "field": "project",
+                    "regex": "^Alpha$"
+                }
+            })]),
+            activity_coverage_sources: vec![meeting.clone()],
+            capabilities: capabilities.clone(),
+            ..AdvancedQueryOptions::default()
+        };
+        let windowless = DesktopQueryParams {
+            base: QueryParamsBase {
+                bid_browsers: vec![],
+                classes: vec![],
+                filter_classes: vec![vec!["Work".to_string()]],
+                filter_afk: false,
+                include_audible: false,
+            },
+            bid_window: String::new(),
+            bid_afk: String::new(),
+            always_active_pattern: None,
+        };
+        let generated = adapt_legacy_desktop_to_current_v2(&windowless, &options).unwrap();
+        assert!(generated.contains("events = categorize_v2(events"));
+        assert!(generated.contains("events = filter_keyvals(events, \"$category\""));
+        let datastore = aw_datastore::Datastore::new_in_memory(false);
+        let timestamp = chrono::DateTime::parse_from_rfc3339("2024-06-01T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        datastore
+            .create_bucket(&aw_models::Bucket {
+                bid: None,
+                id: "meeting-imported".to_string(),
+                _type: "meeting".to_string(),
+                client: "test".to_string(),
+                hostname: "host-a".to_string(),
+                created: Some(timestamp),
+                data: serde_json::Map::new(),
+                metadata: aw_models::BucketMetadata::default(),
+                events: None,
+                last_updated: None,
+            })
+            .unwrap();
+        datastore
+            .insert_events(
+                "meeting-imported",
+                &[aw_models::Event::new(
+                    timestamp,
+                    chrono::Duration::seconds(20),
+                    serde_json::Map::from_iter([(
+                        "project".to_string(),
+                        serde_json::json!("Alpha"),
+                    )]),
+                )],
+            )
+            .unwrap();
+        let interval =
+            aw_models::TimeInterval::new_from_string("2024-06-01T12:00:00Z/2024-06-01T12:00:20Z")
+                .unwrap();
+        let result = aw_query::query(
+            &format!("{generated}; return events;"),
+            &interval,
+            &datastore,
+        )
+        .unwrap();
+        let events = Vec::<aw_models::Event>::try_from(&result).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].data["$category"], serde_json::json!(["Work"]));
+        assert_eq!(
+            events[0].data["$source.meeting.project"],
+            serde_json::json!("Alpha")
+        );
+
+        let with_window = DesktopQueryParams {
+            bid_window: "aw-watcher-window_".to_string(),
+            bid_afk: "aw-watcher-afk_".to_string(),
+            ..windowless
+        };
+        let projected = adapt_legacy_desktop_to_current_v2(&with_window, &options).unwrap();
+        let reset = projected.find("events = period_union([], events)").unwrap();
+        let restored = projected[reset..]
+            .find("merge_subwatcher_fields(events, coverage_source_1, [\"project\"], {\"conflict\":\"base_wins\",\"source_id\":\"meeting\"})")
+            .unwrap();
+        assert!(restored > 0);
+
+        let mut always_active = with_window.clone();
+        always_active.always_active_pattern = Some("meeting".to_string());
+        let generated = adapt_legacy_desktop_to_current_v2(&always_active, &options).unwrap();
+        assert_eq!(
+            generated
+                .matches("find_bucket(\"aw-watcher-window_\", \"host-a\")")
+                .count(),
+            1,
+            "always-active must alias the loaded window stream"
+        );
     }
 
     #[test]
@@ -3633,9 +3379,58 @@ mod tests {
             fields: vec!["title".to_string()],
             conflict: "base_wins".to_string(),
             host: None,
+            interval_policy: IntervalPolicy::Exact,
         };
 
         let serialized = serde_json::to_value(source).unwrap();
         assert!(serialized.get("bucket_hosts").is_none());
+    }
+    #[test]
+    fn public_desktop_wrappers_use_the_current_pipeline_by_default() {
+        let params = DesktopQueryParams {
+            base: QueryParamsBase {
+                bid_browsers: Vec::new(),
+                classes: Vec::new(),
+                filter_classes: Vec::new(),
+                filter_afk: false,
+                include_audible: true,
+            },
+            bid_window: "window".to_string(),
+            bid_afk: "afk".to_string(),
+            always_active_pattern: None,
+        };
+        let direct = build_desktop_canonical_events(&params);
+        let enum_query = QueryParams::Desktop(params.clone()).canonical_events();
+        let options_query = try_build_desktop_canonical_events_with_options(
+            &params,
+            &AdvancedQueryOptions::default(),
+        )
+        .unwrap();
+        let full_query = full_desktop_query(&params);
+        for query in [&direct, &enum_query, &options_query, &full_query] {
+            assert!(query.contains("query_bucket_optional_raw"));
+            assert!(query.contains("query_period()"));
+            assert!(!query.contains("legacy_activity = flood"));
+            assert!(query.contains("Uncategorized"));
+        }
+    }
+
+    #[test]
+    fn explicit_legacy_module_owns_the_old_query_grammar() {
+        let params = DesktopQueryParams {
+            base: QueryParamsBase {
+                bid_browsers: Vec::new(),
+                classes: crate::classes::default_classes(),
+                filter_classes: Vec::new(),
+                filter_afk: false,
+                include_audible: true,
+            },
+            bid_window: "window".to_string(),
+            bid_afk: "afk".to_string(),
+            always_active_pattern: None,
+        };
+        let query = legacy_v1::desktop(&params).unwrap();
+        assert!(query.contains("legacy_activity = flood"));
+        assert!(!query.contains("query_bucket_optional_raw"));
     }
 }

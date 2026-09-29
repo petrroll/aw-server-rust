@@ -28,6 +28,7 @@ rocket = { version = "0.5.0", features = ["json"] }
 rocket_cors = { version = "0.6.0" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+fancy-regex = "0.17"
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "6"
 lazy_static = "1.4"
@@ -44,6 +45,9 @@ aw-datastore = { path = "../aw-datastore", default-features = false }
 aw-models = { path = "../aw-models" }
 aw-transform = { path = "../aw-transform" }
 aw-query = { path = "../aw-query" }
+
+[dev-dependencies]
+aw-client-rust = { path = "../aw-client-rust" }
 
 [target.'cfg(target_os="linux")'.dependencies]
 sd-notify = "0.4.2"

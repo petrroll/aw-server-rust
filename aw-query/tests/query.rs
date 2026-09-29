@@ -334,6 +334,70 @@ mod query_tests {
     }
 
     #[test]
+    fn query_transforms_do_not_mutate_reused_variables() {
+        let ds = setup_datastore_with_bucket();
+        let interval =
+            TimeInterval::new_from_string("2000-01-01T00:00:00Z/2000-01-01T00:00:30Z").unwrap();
+        ds.insert_events(
+            BUCKET_ID,
+            &[Event {
+                id: None,
+                timestamp: *interval.start(),
+                duration: Duration::seconds(10),
+                data: json_map! {
+                    "app": json!("Editor"),
+                    "title": json!("Project"),
+                    "url": json!("https://example.test/path")
+                },
+            }],
+        )
+        .unwrap();
+
+        let query = r#"
+            original = query_bucket_optional_raw("testid", "testhost");
+            bounds = query_period();
+            ignored = period_union([], original);
+            ignored = filter_period_intersect(original, bounds);
+            ignored = union_no_overlap(original, bounds);
+            ignored = flood(original);
+            ignored = flood_v2(original, 5);
+            ignored = merge_subwatcher_fields(original, original, ["title"]);
+            ignored = map_event_fields(original, {"name": "title"});
+            ignored = split_url_events(original);
+            ignored = categorize(original, [[["Legacy"], {"type": "regex", "regex": "Editor"}]]);
+            ignored = categorize_v2(original, [{"name": ["Current"], "rule": {"type": "regex", "regex": "Editor"}}]);
+            ignored = categorize_v2_explain(original, [{"name": ["Current"], "rule": {"type": "regex", "regex": "Editor"}}]);
+            ignored = active_periods_v2([["source", original]], {"type": "regex", "source": "source", "field": "app", "regex": "Editor"});
+            ignored = tag(original, [["editor", {"type": "regex", "regex": "Editor"}]]);
+            ignored = merge_events_by_keys(original, ["app"]);
+            ignored = chunk_events_by_key(original, "app");
+            ignored = filter_keyvals(original, "app", ["Editor"]);
+            ignored = filter_keyvals_regex(original, "app", "Editor");
+            ignored = exclude_keyvals(original, "app", ["Other"]);
+            ignored = sort_by_duration(original);
+            ignored = sort_by_timestamp(original);
+            ignored = sum_durations(original);
+            ignored = limit_events(original, 1);
+            ignored = concat(original, original);
+            return original;
+        "#;
+        let result = aw_query::query(query, &interval, &ds).unwrap();
+        let events = Vec::<Event>::try_from(result).unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].timestamp, *interval.start());
+        assert_eq!(events[0].duration, Duration::seconds(10));
+        assert_eq!(
+            events[0].data,
+            json_map! {
+                "app": json!("Editor"),
+                "title": json!("Project"),
+                "url": json!("https://example.test/path")
+            }
+        );
+    }
+
+    #[test]
     fn test_all_functions() {
         let ds = setup_datastore_populated();
         let interval = TimeInterval::new_from_string(TIME_INTERVAL).unwrap();
@@ -407,6 +471,321 @@ mod query_tests {
 
         let strict = aw_query::query(r#"return query_bucket("missing");"#, &interval, &ds);
         assert!(matches!(strict, Err(QueryError::BucketQueryError(_))));
+    }
+
+    #[test]
+    fn test_raw_source_fetch_boundaries_precedence_and_query_period() {
+        let ds = setup_datastore_with_bucket();
+        let interval =
+            TimeInterval::new_from_string("2000-01-01T00:00:30Z/2000-01-01T00:01:40Z").unwrap();
+        let query_start = *interval.start();
+        let query_end = *interval.end();
+        let origin = query_start - Duration::seconds(30);
+        ds.insert_events(
+            BUCKET_ID,
+            &[
+                Event {
+                    id: None,
+                    timestamp: origin,
+                    duration: Duration::seconds(100),
+                    data: json_map! {"name": json!("old")},
+                },
+                Event {
+                    id: None,
+                    timestamp: origin + Duration::seconds(20),
+                    duration: Duration::seconds(60),
+                    data: json_map! {"name": json!("new")},
+                },
+                Event {
+                    id: None,
+                    timestamp: query_start - Duration::seconds(10),
+                    duration: Duration::seconds(10),
+                    data: json_map! {"name": json!("left-touch")},
+                },
+                Event {
+                    id: None,
+                    timestamp: query_end,
+                    duration: Duration::seconds(10),
+                    data: json_map! {"name": json!("right-touch")},
+                },
+            ],
+        )
+        .unwrap();
+
+        let raw = aw_query::query(
+            r#"return query_bucket_optional_raw("testid", "testhost");"#,
+            &interval,
+            &ds,
+        )
+        .unwrap();
+        let raw_events = Vec::<Event>::try_from(&raw).unwrap();
+        assert_eq!(raw_events.len(), 2);
+        let old = raw_events
+            .iter()
+            .find(|event| event.data["name"] == json!("old"))
+            .unwrap();
+        let new = raw_events
+            .iter()
+            .find(|event| event.data["name"] == json!("new"))
+            .unwrap();
+        assert_eq!(old.timestamp, origin);
+        assert_eq!(old.duration, Duration::seconds(100));
+        assert_eq!(new.timestamp, origin + Duration::seconds(20));
+        assert_eq!(new.duration, Duration::seconds(60));
+
+        let mismatch = aw_query::query(
+            r#"return query_bucket_optional_raw("testid", "other-host");"#,
+            &interval,
+            &ds,
+        )
+        .unwrap();
+        assert!(Vec::<Event>::try_from(&mismatch).unwrap().is_empty());
+
+        let merged = aw_query::query(
+            r#"
+                coverage = query_period();
+                context = query_bucket_optional_raw("testid", "testhost");
+                return merge_subwatcher_fields(coverage, context, ["name"]);
+            "#,
+            &interval,
+            &ds,
+        )
+        .unwrap();
+        let merged = Vec::<Event>::try_from(&merged).unwrap();
+        assert_eq!(
+            merged
+                .iter()
+                .map(|event| (event.timestamp, event.duration, event.data["name"].clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (query_start, Duration::seconds(50), json!("new")),
+                (
+                    query_start + Duration::seconds(50),
+                    Duration::seconds(20),
+                    json!("old")
+                ),
+            ]
+        );
+        assert_eq!(
+            merged.iter().map(|event| event.duration).sum::<Duration>(),
+            query_end - query_start
+        );
+    }
+
+    #[test]
+    fn test_raw_source_order_makes_exact_ties_deterministic() {
+        let ds = setup_datastore_with_bucket();
+        let interval =
+            TimeInterval::new_from_string("2000-01-01T00:00:00Z/2000-01-01T00:01:00Z").unwrap();
+        let start = *interval.start();
+        ds.insert_events(
+            BUCKET_ID,
+            &[
+                Event {
+                    id: None,
+                    timestamp: start,
+                    duration: Duration::seconds(30),
+                    data: json_map! {"name": json!("first")},
+                },
+                Event {
+                    id: None,
+                    timestamp: start,
+                    duration: Duration::seconds(20),
+                    data: json_map! {"name": json!("shorter")},
+                },
+                Event {
+                    id: None,
+                    timestamp: start,
+                    duration: Duration::seconds(30),
+                    data: json_map! {"name": json!("second")},
+                },
+            ],
+        )
+        .unwrap();
+
+        let result = aw_query::query(
+            r#"
+                raw = query_bucket_optional_raw("testid", null);
+                enriched = merge_subwatcher_fields(query_period(), raw, ["name"]);
+                return [raw, enriched];
+            "#,
+            &interval,
+            &ds,
+        )
+        .unwrap();
+        let lists = Vec::<DataType>::try_from(result).unwrap();
+        let raw = Vec::<Event>::try_from(lists[0].clone()).unwrap();
+        assert_eq!(
+            raw.iter()
+                .map(|event| event.data["name"].clone())
+                .collect::<Vec<_>>(),
+            vec![json!("shorter"), json!("first"), json!("second")]
+        );
+        assert!(raw[1].id < raw[2].id);
+        let enriched = Vec::<Event>::try_from(lists[1].clone()).unwrap();
+        assert_eq!(enriched[0].data["name"], json!("second"));
+    }
+
+    #[test]
+    fn test_raw_source_padding_captures_heartbeat_neighbors() {
+        let ds = setup_datastore_with_bucket();
+        let interval =
+            TimeInterval::new_from_string("2000-01-01T00:00:12Z/2000-01-01T00:00:13Z").unwrap();
+        let origin = *interval.start() - Duration::seconds(12);
+        ds.insert_events(
+            BUCKET_ID,
+            &[
+                Event {
+                    id: None,
+                    timestamp: origin,
+                    duration: Duration::seconds(10),
+                    data: json_map! {"name": json!("left")},
+                },
+                Event {
+                    id: None,
+                    timestamp: origin + Duration::seconds(14),
+                    duration: Duration::seconds(10),
+                    data: json_map! {"name": json!("right")},
+                },
+            ],
+        )
+        .unwrap();
+
+        let unpadded = aw_query::query(
+            r#"return query_bucket_optional_raw("testid", null, 0);"#,
+            &interval,
+            &ds,
+        )
+        .unwrap();
+        assert!(Vec::<Event>::try_from(&unpadded).unwrap().is_empty());
+
+        let padded = aw_query::query(
+            r#"return query_bucket_optional_raw("testid", null, 5);"#,
+            &interval,
+            &ds,
+        )
+        .unwrap();
+        let padded = Vec::<Event>::try_from(&padded).unwrap();
+        assert_eq!(padded.len(), 2);
+        let left = padded
+            .iter()
+            .find(|event| event.data["name"] == json!("left"))
+            .unwrap();
+        let right = padded
+            .iter()
+            .find(|event| event.data["name"] == json!("right"))
+            .unwrap();
+        assert_eq!(left.timestamp, origin);
+        assert_eq!(left.duration, Duration::seconds(10));
+        assert_eq!(right.timestamp, origin + Duration::seconds(14));
+        assert_eq!(right.duration, Duration::seconds(10));
+
+        // Half-open lookup boundaries and fractional padding use microsecond
+        // precision without modifying the selected record.
+        let at_boundary = aw_query::query(
+            r#"return query_bucket_optional_raw("testid", null, 1);"#,
+            &interval,
+            &ds,
+        )
+        .unwrap();
+        assert!(Vec::<Event>::try_from(&at_boundary).unwrap().is_empty());
+        let past_boundary = aw_query::query(
+            r#"return query_bucket_optional_raw("testid", null, 1.000001);"#,
+            &interval,
+            &ds,
+        )
+        .unwrap();
+        let past_boundary = Vec::<Event>::try_from(&past_boundary).unwrap();
+        assert_eq!(past_boundary.len(), 1);
+        assert_eq!(past_boundary[0].timestamp, origin + Duration::seconds(14));
+        assert_eq!(past_boundary[0].duration, Duration::seconds(10));
+
+        let correct_host = aw_query::query(
+            r#"return query_bucket_optional_raw("testid", "testhost", 5);"#,
+            &interval,
+            &ds,
+        )
+        .unwrap();
+        assert_eq!(Vec::<Event>::try_from(&correct_host).unwrap().len(), 2);
+        let wrong_host = aw_query::query(
+            r#"return query_bucket_optional_raw("testid", "other-host", 5);"#,
+            &interval,
+            &ds,
+        )
+        .unwrap();
+        assert!(Vec::<Event>::try_from(&wrong_host).unwrap().is_empty());
+
+        // flood_v2 can now see both gap neighbors, but query_period remains
+        // unpadded and bounds the resulting activity mask to [12, 13).
+        let bounded = aw_query::query(
+            r#"
+                raw = query_bucket_optional_raw("testid", null, 5);
+                flooded = flood_v2(raw, 5);
+                return filter_period_intersect(flooded, query_period());
+            "#,
+            &interval,
+            &ds,
+        )
+        .unwrap();
+        let bounded = Vec::<Event>::try_from(&bounded).unwrap();
+        assert_eq!(bounded.len(), 1);
+        assert_eq!(bounded[0].timestamp, *interval.start());
+        assert_eq!(bounded[0].duration, Duration::seconds(1));
+        assert_eq!(bounded[0].data["name"], json!("left"));
+
+        let empty_interval =
+            TimeInterval::new_from_string("2000-01-01T00:00:12Z/2000-01-01T00:00:12Z").unwrap();
+        let empty = aw_query::query(
+            r#"return query_bucket_optional_raw("testid", null, 5);"#,
+            &empty_interval,
+            &ds,
+        )
+        .unwrap();
+        assert!(Vec::<Event>::try_from(&empty).unwrap().is_empty());
+
+        for invalid in ["-1", "3600.000001", "null", r#""5""#, "true", "1e309"] {
+            let code = format!(r#"return query_bucket_optional_raw("testid", null, {invalid});"#);
+            let error = aw_query::query(&code, &interval, &ds).unwrap_err();
+            assert!(matches!(&error, QueryError::InvalidFunctionParameters(_)));
+            assert!(format!("{error}").contains("padding_seconds"));
+        }
+        let invalid_hostname = aw_query::query(
+            r#"return query_bucket_optional_raw("testid", 5, 5);"#,
+            &interval,
+            &ds,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            &invalid_hostname,
+            QueryError::InvalidFunctionParameters(_)
+        ));
+        assert!(format!("{invalid_hostname}").contains("expected_hostname"));
+    }
+
+    #[test]
+    fn test_query_period_is_empty_for_empty_interval() {
+        let ds = setup_datastore_empty();
+        let interval =
+            TimeInterval::new_from_string("2000-01-01T00:00:30Z/2000-01-01T00:00:30Z").unwrap();
+        let result = aw_query::query("return query_period();", &interval, &ds).unwrap();
+        assert!(Vec::<Event>::try_from(&result).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_legacy_categorize_accepts_legacy_limits_and_reports_runtime_errors() {
+        let ds = setup_datastore_empty();
+        let interval = TimeInterval::new_from_string(TIME_INTERVAL).unwrap();
+        let rules = (0..1001)
+            .map(|index| format!(r#"[["Category {index}"], {{"type":"regex","regex":"x"}}]"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let result = aw_query::query(
+            &format!("return categorize([], [{rules}]);"),
+            &interval,
+            &ds,
+        )
+        .unwrap();
+        assert!(Vec::<Event>::try_from(result).unwrap().is_empty());
     }
 
     #[test]
@@ -586,7 +965,7 @@ mod query_tests {
         let result = aw_query::query(&code, &interval, &ds).unwrap();
         let events: Vec<Event> = Vec::try_from(&result).unwrap();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].data["state"], json!("active"));
+        assert!(events[0].data.is_empty());
     }
 
     #[test]

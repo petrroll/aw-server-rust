@@ -1,20 +1,17 @@
 use std::collections::{HashMap, HashSet};
 
 use aw_models::Event;
-use fancy_regex::Regex;
 use serde_json::{json, Value};
+
+use crate::predicate::{selected_values, RegexPredicate, ValueMode};
 
 pub(crate) const MAX_EXPRESSION_DEPTH: usize = 32;
 pub(crate) const MAX_EXPRESSION_NODES: usize = 4096;
 pub(crate) const MAX_REGEX_LENGTH: usize = 4096;
 pub(crate) const MAX_CATEGORY_RULES: usize = 1000;
 pub(crate) const MAX_RULE_SOURCES: usize = 128;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ValueMode {
-    String,
-    Scalar,
-}
+pub(crate) const MIN_RULE_INTEGER: i64 = -1_000_000;
+pub(crate) const MAX_RULE_INTEGER: i64 = 1_000_000;
 
 #[derive(Clone, Copy, Debug)]
 struct MatchResult {
@@ -25,10 +22,8 @@ struct MatchResult {
 enum RuleExpression {
     None,
     Regex {
-        regex: Regex,
-        negate: bool,
+        predicate: RegexPredicate,
         weight: i64,
-        value_mode: ValueMode,
         source: Option<String>,
         host: Option<String>,
         fields: Option<Vec<String>>,
@@ -45,10 +40,8 @@ impl RuleExpression {
                 score: 0,
             },
             Self::Regex {
-                regex,
-                negate,
+                predicate,
                 weight,
-                value_mode,
                 source,
                 host,
                 fields,
@@ -61,7 +54,7 @@ impl RuleExpression {
                         score: 0,
                     }
                 } else {
-                    match_regex(event, regex, *negate, *weight, *value_mode, source, fields).0
+                    match_regex(event, predicate, *weight, source, fields)?.0
                 }
             }
             Self::All(expressions) => {
@@ -104,10 +97,8 @@ impl RuleExpression {
         Ok(match self {
             Self::None => json!({"type": "none", "matched": false, "score": 0}),
             Self::Regex {
-                regex,
-                negate,
+                predicate,
                 weight,
-                value_mode,
                 source,
                 host,
                 fields,
@@ -116,7 +107,7 @@ impl RuleExpression {
                     event.data.get("$host").and_then(Value::as_str) == Some(host.as_str())
                 });
                 let (result, value_count) = if host_matched {
-                    match_regex(event, regex, *negate, *weight, *value_mode, source, fields)
+                    match_regex(event, predicate, *weight, source, fields)?
                 } else {
                     (
                         MatchResult {
@@ -183,37 +174,20 @@ impl RuleExpression {
 
 fn match_regex(
     event: &Event,
-    regex: &Regex,
-    negate: bool,
+    predicate: &RegexPredicate,
     weight: i64,
-    value_mode: ValueMode,
     source: &Option<String>,
     fields: &Option<Vec<String>>,
-) -> (MatchResult, usize) {
-    let values = selected_values(event, source.as_deref(), fields.as_deref())
-        .into_iter()
-        .filter_map(|value| normalize_value(value, value_mode))
-        .collect::<Vec<_>>();
-    if values.is_empty() {
-        return (
-            MatchResult {
-                matched: false,
-                score: 0,
-            },
-            0,
-        );
-    }
-    let any_match = values
-        .iter()
-        .any(|value| regex.is_match(value).unwrap_or(false));
-    let matched = if negate { !any_match } else { any_match };
-    (
+) -> Result<(MatchResult, usize), String> {
+    let result =
+        predicate.evaluate(selected_values(event, source.as_deref(), fields.as_deref()))?;
+    Ok((
         MatchResult {
-            matched,
-            score: if matched { weight } else { 0 },
+            matched: result.matched,
+            score: if result.matched { weight } else { 0 },
         },
-        values.len(),
-    )
+        result.value_count,
+    ))
 }
 
 fn explanation_matched(value: &Value) -> bool {
@@ -232,8 +206,54 @@ pub struct CategoryRule {
     name: Vec<String>,
     expression: RuleExpression,
     priority: i64,
+    set_priority: i64,
     requires: Vec<String>,
     index: usize,
+}
+
+pub(crate) fn categorize_legacy(
+    events: Vec<Event>,
+    legacy_rules: &[(Vec<String>, crate::classify::Rule)],
+) -> Result<Vec<Event>, String> {
+    let mut legacy_fields = events
+        .iter()
+        .flat_map(|event| event.data.keys().cloned())
+        .collect::<Vec<_>>();
+    legacy_fields.sort();
+    legacy_fields.dedup();
+    if legacy_fields.is_empty() {
+        legacy_fields.push("__legacy_missing__".to_string());
+    }
+
+    let rules = legacy_rules
+        .iter()
+        .enumerate()
+        .filter(|(_, (category, _))| !category.is_empty())
+        .map(|(index, (category, rule))| CategoryRule {
+            id: format!("legacy-{index}"),
+            name: category.clone(),
+            expression: match rule {
+                crate::classify::Rule::None => RuleExpression::None,
+                crate::classify::Rule::Regex(regex) => RuleExpression::Regex {
+                    predicate: RegexPredicate::from_compiled(regex.regex.clone()),
+                    weight: 0,
+                    source: None,
+                    host: None,
+                    fields: Some(
+                        regex
+                            .select_keys
+                            .clone()
+                            .unwrap_or_else(|| legacy_fields.clone()),
+                    ),
+                },
+            },
+            priority: 0,
+            set_priority: 0,
+            requires: Vec::new(),
+            index,
+        })
+        .collect::<Vec<_>>();
+    categorize_with_rules(events, &rules, None)
 }
 
 pub fn compile_category_rules(specs: &Value) -> Result<Vec<CategoryRule>, String> {
@@ -270,8 +290,10 @@ pub fn compile_category_rules(specs: &Value) -> Result<Vec<CategoryRule>, String
             return Err(format!("duplicate category rule id: {id:?}"));
         }
 
-        let priority = parse_integer(spec.get("priority"), 0)
-            .map_err(|_| format!("category rule {id:?} 'priority' must be an integer"))?;
+        let priority = parse_rule_integer(spec.get("priority"), 0)
+            .map_err(|_| rule_integer_error(&format!("category rule {id:?} 'priority'")))?;
+        let set_priority = parse_rule_integer(spec.get("set_priority"), 0)
+            .map_err(|_| rule_integer_error(&format!("category rule {id:?} 'set_priority'")))?;
         let requires = match spec.get("requires") {
             None => Vec::new(),
             Some(value) => parse_string_list(value).map_err(|_| {
@@ -290,6 +312,7 @@ pub fn compile_category_rules(specs: &Value) -> Result<Vec<CategoryRule>, String
             name,
             expression,
             priority,
+            set_priority,
             requires,
             index,
         });
@@ -304,7 +327,7 @@ pub fn categorize_v2(events: Vec<Event>, category_specs: &Value) -> Result<Vec<E
 }
 
 pub fn categorize_v2_for_host(
-    mut events: Vec<Event>,
+    events: Vec<Event>,
     category_specs: &Value,
     host: Option<&str>,
 ) -> Result<Vec<Event>, String> {
@@ -312,7 +335,14 @@ pub fn categorize_v2_for_host(
         return Err("categorization host must be a non-empty string".to_string());
     }
     let rules = compile_category_rules(category_specs)?;
+    categorize_with_rules(events, &rules, host)
+}
 
+fn categorize_with_rules(
+    mut events: Vec<Event>,
+    rules: &[CategoryRule],
+    host: Option<&str>,
+) -> Result<Vec<Event>, String> {
     for event in &mut events {
         let previous_host = host.map(|host| event.data.insert("$host".to_string(), json!(host)));
         let raw_matches: HashMap<&str, MatchResult> = rules
@@ -329,6 +359,7 @@ pub fn categorize_v2_for_host(
                     raw_matches[rule.id.as_str()].score,
                     rule.priority,
                     rule.name.len(),
+                    rule.set_priority,
                     rule.index,
                 )
             });
@@ -401,6 +432,7 @@ pub fn categorize_v2_explain_for_host(
                     raw_matches[rule.id.as_str()].score,
                     rule.priority,
                     rule.name.len(),
+                    rule.set_priority,
                     rule.index,
                 )
             });
@@ -448,6 +480,7 @@ pub fn categorize_v2_explain_for_host(
                     "score": raw_matches[rule.id.as_str()].score,
                     "priority": rule.priority,
                     "depth": rule.name.len(),
+                    "set_priority": rule.set_priority,
                     "requires": rule.requires,
                     "requirements": requirements,
                     "expression": raw_explanations[rule.id.as_str()],
@@ -564,23 +597,12 @@ fn compile_regex_expression(
     }
     let ignore_case = parse_bool(spec.get("ignore_case"), false)
         .map_err(|_| "regex rule 'ignore_case' must be a boolean".to_string())?;
-    let regex_source = if ignore_case {
-        format!("(?i){regex_pattern}")
-    } else {
-        regex_pattern.clone()
-    };
-    let regex = Regex::new(&regex_source)
-        .map_err(|error| format!("invalid regex {regex_pattern:?}: {error}"))?;
     let negate = parse_bool(spec.get("negate"), false)
         .map_err(|_| "regex rule 'negate' must be a boolean".to_string())?;
-    let weight = parse_integer(spec.get("weight"), 0)
-        .map_err(|_| "regex rule 'weight' must be an integer".to_string())?;
-    let value_mode = match spec.get("value_mode") {
-        None => ValueMode::String,
-        Some(Value::String(value)) if value == "string" => ValueMode::String,
-        Some(Value::String(value)) if value == "scalar" => ValueMode::Scalar,
-        _ => return Err("regex rule 'value_mode' must be 'string' or 'scalar'".to_string()),
-    };
+    let weight = parse_rule_integer(spec.get("weight"), 0)
+        .map_err(|_| rule_integer_error("regex rule 'weight'"))?;
+    let value_mode = ValueMode::parse(spec.get("value_mode"), "regex rule")?;
+    let predicate = RegexPredicate::compile(regex_pattern, ignore_case, negate, value_mode)?;
     let source = match spec.get("source") {
         None | Some(Value::Null) => None,
         Some(Value::String(source)) => {
@@ -635,65 +657,12 @@ fn compile_regex_expression(
     };
 
     Ok(RuleExpression::Regex {
-        regex,
-        negate,
+        predicate,
         weight,
-        value_mode,
         source,
         host,
         fields,
     })
-}
-
-fn selected_values<'a>(
-    event: &'a Event,
-    source: Option<&str>,
-    fields: Option<&[String]>,
-) -> Vec<&'a Value> {
-    let source_prefix = source
-        .filter(|source| !source.is_empty())
-        .map(|source| format!("$source.{source}."));
-    if let Some(fields) = fields {
-        return fields
-            .iter()
-            .filter_map(|field| {
-                let key = source_prefix
-                    .as_ref()
-                    .map(|prefix| format!("{prefix}{field}"))
-                    .unwrap_or_else(|| field.clone());
-                event.data.get(&key)
-            })
-            .collect();
-    }
-    if let Some(source_prefix) = source_prefix {
-        return event
-            .data
-            .iter()
-            .filter(|(key, _)| key.starts_with(&source_prefix))
-            .map(|(_, value)| value)
-            .collect();
-    }
-
-    event
-        .data
-        .iter()
-        .filter(|(key, _)| {
-            !matches!(
-                key.as_str(),
-                "$category" | "$category_score" | "$category_rule" | "$category_explain" | "$host"
-            ) && !key.starts_with("$source.")
-        })
-        .map(|(_, value)| value)
-        .collect()
-}
-
-fn normalize_value(value: &Value, value_mode: ValueMode) -> Option<String> {
-    match (value_mode, value) {
-        (_, Value::String(value)) => Some(value.clone()),
-        (ValueMode::Scalar, Value::Bool(value)) => Some(value.to_string()),
-        (ValueMode::Scalar, Value::Number(value)) => Some(value.to_string()),
-        _ => None,
-    }
 }
 
 fn validate_requirements(rules: &[CategoryRule]) -> Result<(), String> {
@@ -788,23 +757,24 @@ fn parse_bool(value: Option<&Value>, default: bool) -> Result<bool, ()> {
     }
 }
 
-fn parse_integer(value: Option<&Value>, default: i64) -> Result<i64, ()> {
+fn parse_rule_integer(value: Option<&Value>, default: i64) -> Result<i64, ()> {
     match value {
         None => Ok(default),
         Some(Value::Number(value)) => value
             .as_i64()
             .or_else(|| {
                 value.as_f64().and_then(|value| {
-                    (value.is_finite()
-                        && value.fract() == 0.0
-                        && value >= i64::MIN as f64
-                        && value <= i64::MAX as f64)
-                        .then_some(value as i64)
+                    (value.is_finite() && value.fract() == 0.0).then_some(value as i64)
                 })
             })
+            .filter(|value| (MIN_RULE_INTEGER..=MAX_RULE_INTEGER).contains(value))
             .ok_or(()),
         _ => Err(()),
     }
+}
+
+fn rule_integer_error(field: &str) -> String {
+    format!("{field} must be an integer between {MIN_RULE_INTEGER} and {MAX_RULE_INTEGER}")
 }
 
 fn parse_nonempty_string_list(value: Option<&Value>) -> Result<Vec<String>, ()> {
@@ -1059,6 +1029,49 @@ mod tests {
     }
 
     #[test]
+    fn set_priority_ranks_after_category_depth_and_is_explained() {
+        let categories = json!([
+            {
+                "id": "high-set-shallow",
+                "name": ["Shallow"],
+                "set_priority": 100,
+                "rule": {"type": "regex", "regex": "match"}
+            },
+            {
+                "id": "low-set-deep",
+                "name": ["Deep", "Child"],
+                "set_priority": 1,
+                "rule": {"type": "regex", "regex": "match"}
+            },
+            {
+                "id": "high-set-deep",
+                "name": ["Winning", "Child"],
+                "set_priority": 2,
+                "rule": {"type": "regex", "regex": "match"}
+            }
+        ]);
+        let result =
+            categorize_v2_explain(vec![event(json!({"title": "match"}))], &categories).unwrap();
+        assert_eq!(result[0].data["$category"], json!(["Winning", "Child"]));
+        let priorities = result[0].data["$category_explain"]["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|candidate| candidate["set_priority"].as_i64().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(priorities, vec![100, 1, 2]);
+
+        let invalid = json!([{
+            "name": ["Bad"],
+            "set_priority": 1.5,
+            "rule": {"type": "none"}
+        }]);
+        assert!(categorize_v2(Vec::new(), &invalid)
+            .unwrap_err()
+            .contains("'set_priority' must be an integer"));
+    }
+
+    #[test]
     fn field_aliases_priority_and_requirements_are_applied() {
         let aliases = json!([
             {
@@ -1177,23 +1190,75 @@ mod tests {
     }
 
     #[test]
-    fn rejects_score_overflow_in_categorization_and_explanations() {
+    fn scalar_predicates_use_ecmascript_spelling() {
+        let cases = [
+            (json!(1e-7), "^1e-7$"),
+            (json!(1e-6), "^0\\.000001$"),
+            (json!(1.5), "^1\\.5$"),
+            (json!(1.0), "^1$"),
+            (json!(-0.0), "^0$"),
+            (json!(0.1), "^0\\.1$"),
+            (json!(1e20), "^100000000000000000000$"),
+            (json!(1e21), "^1e\\+21$"),
+            (json!(123.456e5), "^12345600$"),
+            (json!(1_000_000_000_000_000.2), "^1000000000000000\\.2$"),
+            (json!(1_551_040_077_889.2812), "^1551040077889\\.2812$"),
+            (json!(true), "^true$"),
+            (json!(9_007_199_254_740_993_i64), "^9007199254740993$"),
+        ];
+        for (value, regex) in cases {
+            let categories = json!([{
+                "name": ["Matched"],
+                "rule": {
+                    "type": "regex", "field": "value", "regex": regex,
+                    "value_mode": "scalar"
+                }
+            }]);
+            let result =
+                categorize_v2(vec![event(json!({"value": value.clone()}))], &categories).unwrap();
+            assert_eq!(result[0].data["$category"], json!(["Matched"]), "{value}");
+        }
+    }
+
+    #[test]
+    fn regex_runtime_failures_propagate_from_matches_and_explanations() {
         let categories = json!([{
-            "name": ["Overflow"],
+            "name": ["Negated"],
             "rule": {
-                "type": "all",
-                "rules": [
-                    {"type": "regex", "regex": "match", "weight": i64::MAX},
-                    {"type": "regex", "regex": "match", "weight": 1}
-                ]
+                "type": "regex", "field": "value",
+                "regex": "^(a+)+(?=b)$|^a+!$", "negate": true
             }
         }]);
-        let events = vec![event(json!({"title": "match"}))];
+        let events = vec![event(json!({"value": format!("{}!", "a".repeat(30))}))];
 
         let error = categorize_v2(events.clone(), &categories).unwrap_err();
-        assert!(error.contains("score overflowed"));
-
+        assert!(error.contains("regex execution failed"), "{error}");
         let error = categorize_v2_explain(events, &categories).unwrap_err();
-        assert!(error.contains("score overflowed"));
+        assert!(error.contains("regex execution failed"), "{error}");
+    }
+
+    #[test]
+    fn ranking_integers_are_bounded() {
+        let boundaries = json!([
+            {
+                "name": ["Minimum"], "priority": -1_000_000, "set_priority": -1_000_000,
+                "rule": {"type": "regex", "regex": "match", "weight": -1_000_000}
+            },
+            {
+                "name": ["Maximum"], "priority": 1_000_000, "set_priority": 1_000_000,
+                "rule": {"type": "regex", "regex": "match", "weight": 1_000_000}
+            }
+        ]);
+        let result = categorize_v2(vec![event(json!({"value": "match"}))], &boundaries).unwrap();
+        assert_eq!(result[0].data["$category"], json!(["Maximum"]));
+
+        for categories in [
+            json!([{"name": ["Bad"], "priority": 1_000_001, "rule": {"type": "none"}}]),
+            json!([{"name": ["Bad"], "set_priority": -1_000_001, "rule": {"type": "none"}}]),
+            json!([{"name": ["Bad"], "rule": {"type": "regex", "regex": ".", "weight": true}}]),
+        ] {
+            let error = categorize_v2(Vec::new(), &categories).unwrap_err();
+            assert!(error.contains("between -1000000 and 1000000"), "{error}");
+        }
     }
 }

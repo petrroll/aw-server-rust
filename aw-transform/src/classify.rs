@@ -4,6 +4,7 @@
 use aw_models::Event;
 use fancy_regex::Regex;
 
+/// Rule shape used by the legacy Query2 `categorize` and `tag` transforms.
 pub enum Rule {
     None,
     Regex(RegexRule),
@@ -23,8 +24,8 @@ trait RuleTrait {
 }
 
 pub struct RegexRule {
-    regex: Regex,
-    select_keys: Option<Vec<String>>,
+    pub(crate) regex: Regex,
+    pub(crate) select_keys: Option<Vec<String>>,
 }
 
 impl RegexRule {
@@ -91,33 +92,41 @@ impl From<Regex> for Rule {
     }
 }
 
-/// Categorizes a list of events
-///
-/// An event can only have one category, although the category may have a hierarchy,
-/// for instance: "Work -> ActivityWatch -> aw-server-rust"
-/// If multiple categories match, the deepest one will be chosen.
-pub fn categorize(mut events: Vec<Event>, rules: &[(Vec<String>, Rule)]) -> Vec<Event> {
-    let mut classified_events = Vec::new();
-    for event in events.drain(..) {
-        classified_events.push(categorize_one(event, rules));
-    }
-    classified_events
-}
-
-fn categorize_one(mut event: Event, rules: &[(Vec<String>, Rule)]) -> Event {
-    let mut category: Vec<String> = vec!["Uncategorized".into()];
-    for (cat, rule) in rules {
-        if rule.matches(&event) {
-            category = _pick_highest_ranking_category(category, cat);
+/// Categorizes events through the current evaluator and projects the legacy
+/// `$category`-only metadata contract.
+pub fn categorize(events: Vec<Event>, rules: &[(Vec<String>, Rule)]) -> Result<Vec<Event>, String> {
+    let preserved_metadata = events
+        .iter()
+        .map(|event| {
+            (
+                event.data.get("$category_score").cloned(),
+                event.data.get("$category_rule").cloned(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut categorized = crate::classify_v2::categorize_legacy(events, rules)?;
+    for (event, (old_score, old_rule)) in categorized.iter_mut().zip(preserved_metadata) {
+        match old_score {
+            Some(value) => {
+                event.data.insert("$category_score".to_string(), value);
+            }
+            None => {
+                event.data.remove("$category_score");
+            }
+        }
+        match old_rule {
+            Some(value) => {
+                event.data.insert("$category_rule".to_string(), value);
+            }
+            None => {
+                event.data.remove("$category_rule");
+            }
         }
     }
-    event
-        .data
-        .insert("$category".into(), serde_json::json!(category));
-    event
+    Ok(categorized)
 }
 
-/// Tags a list of events
+/// Legacy Query2 transform that attaches every matching tag.
 ///
 /// An event can have many tags (as opposed to only one category) which will be put into the `$tags` key of
 /// the event data object.
@@ -140,15 +149,6 @@ fn tag_one(mut event: Event, rules: &[(String, Rule)]) -> Event {
     tags.dedup();
     event.data.insert("$tags".into(), serde_json::json!(tags));
     event
-}
-
-fn _pick_highest_ranking_category(acc: Vec<String>, item: &[String]) -> Vec<String> {
-    if item.len() >= acc.len() {
-        // If tag is category with greater or equal depth than current, then choose the new one instead.
-        item.to_vec()
-    } else {
-        acc
-    }
 }
 
 #[test]
@@ -239,13 +239,89 @@ fn test_categorize() {
             Rule::from(Regex::new(r"nonmatching").unwrap()),
         ),
     ];
-    events = categorize(events, &rules);
+    events = categorize(events, &rules).unwrap();
 
     assert_eq!(events.len(), 1);
     assert_eq!(
         events.first().unwrap().data.get("$category").unwrap(),
         &serde_json::json!(vec!["Test", "Subtest"])
     );
+}
+
+#[test]
+fn test_legacy_categorize_projects_old_shape_from_v2_pipeline() {
+    let mut first = Event::default();
+    first
+        .data
+        .insert("$source.context.name".into(), serde_json::json!("match"));
+    let mut second = Event::default();
+    second
+        .data
+        .insert("title".into(), serde_json::json!("match"));
+    second
+        .data
+        .insert("$category_score".into(), serde_json::json!(99));
+    second
+        .data
+        .insert("$category_rule".into(), serde_json::json!("preexisting"));
+    let rules = vec![
+        (
+            vec!["First".into()],
+            Rule::Regex(RegexRule::new("match", false, None).unwrap()),
+        ),
+        (
+            vec!["Later".into()],
+            Rule::Regex(RegexRule::new("match", false, None).unwrap()),
+        ),
+    ];
+
+    let result = categorize(vec![first, second], &rules).unwrap();
+    assert_eq!(result[0].data["$category"], serde_json::json!(["Later"]));
+    assert!(!result[0].data.contains_key("$category_score"));
+    assert!(!result[0].data.contains_key("$category_rule"));
+    assert_eq!(result[1].data["$category"], serde_json::json!(["Later"]));
+    assert_eq!(result[1].data["$category_score"], serde_json::json!(99));
+    assert_eq!(
+        result[1].data["$category_rule"],
+        serde_json::json!("preexisting")
+    );
+}
+
+#[test]
+fn test_legacy_categorize_does_not_apply_v2_schema_budgets() {
+    let rules = (0..1001)
+        .map(|index| {
+            (
+                vec![format!("Category {index}")],
+                Rule::Regex(RegexRule::new("x", false, None).unwrap()),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(categorize(Vec::new(), &rules).unwrap().is_empty());
+
+    let long_pattern = "x".repeat(4097);
+    let rules = vec![(
+        vec!["Long".to_string()],
+        Rule::Regex(RegexRule::new(&long_pattern, false, None).unwrap()),
+    )];
+    assert!(categorize(Vec::new(), &rules).unwrap().is_empty());
+}
+
+#[test]
+fn test_legacy_categorize_propagates_regex_runtime_errors() {
+    let mut event = Event::default();
+    event.data.insert(
+        "value".to_string(),
+        serde_json::json!(format!("{}!", "a".repeat(30))),
+    );
+    let rules = vec![(
+        vec!["Runtime error".to_string()],
+        Rule::Regex(
+            RegexRule::new("^(a+)+(?=b)$|^a+!$", false, Some(vec!["value".into()])).unwrap(),
+        ),
+    )];
+    let error = categorize(vec![event], &rules).unwrap_err();
+    assert!(error.contains("regex execution failed"), "{error}");
 }
 
 #[test]
@@ -260,7 +336,7 @@ fn test_categorize_uncategorized() {
         vec!["Non-matching".into(), "test".into()],
         Rule::from(Regex::new(r"not going to match").unwrap()),
     )];
-    events = categorize(events, &rules);
+    events = categorize(events, &rules).unwrap();
 
     assert_eq!(events.len(), 1);
     assert_eq!(

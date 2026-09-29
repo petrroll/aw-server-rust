@@ -8,6 +8,7 @@ extern crate tokio;
 pub mod blocking;
 pub mod classes;
 pub mod queries;
+pub mod rules_v2;
 pub mod single_instance;
 
 use std::{collections::HashMap, error::Error};
@@ -266,6 +267,54 @@ impl AwClient {
     pub async fn get_settings(&self) -> Result<aw_models::Settings, reqwest::Error> {
         let url = format!("{}api/0/settings", self.baseurl);
         Self::send_success(self.client.get(url)).await?.json().await
+    }
+
+    /// Fetch settings without discarding additive canonical rule keys.
+    pub async fn get_settings_value(&self) -> Result<serde_json::Value, reqwest::Error> {
+        let url = format!("{}api/0/settings", self.baseurl);
+        Self::send_success(self.client.get(url)).await?.json().await
+    }
+
+    /// Compile a stored profile using this client's server, bucket inventory,
+    /// and advertised capabilities. A missing canonical document is migrated in
+    /// memory; this read path never writes settings.
+    pub async fn build_profile_query_v2(
+        &self,
+        request: &rules_v2::ProfileQueryRequest,
+    ) -> Result<rules_v2::MaterializedProfileV2, rules_v2::ProfileQueryError> {
+        let capabilities = self.get_info_with_capabilities().await?.capabilities;
+        let document = if capabilities
+            .iter()
+            .any(|item| item == "settings.rules_v2.v1")
+        {
+            match self.get_setting("rules_v2").await {
+                Ok(document) => document,
+                Err(error) if error.status() == Some(reqwest::StatusCode::NOT_FOUND) => {
+                    rules_v2::migrate_legacy_settings(&self.get_settings_value().await?)
+                }
+                Err(error) => return Err(error.into()),
+            }
+        } else {
+            rules_v2::migrate_legacy_settings(&self.get_settings_value().await?)
+        };
+        let buckets = self.get_buckets().await?;
+        rules_v2::compile_profile_v2(&document, &buckets, capabilities, request)
+            .map_err(rules_v2::ProfileQueryError::Invalid)
+    }
+
+    pub async fn query_profile_v2(
+        &self,
+        request: &rules_v2::ProfileQueryRequest,
+        timeperiods: Vec<(DateTime<Utc>, DateTime<Utc>)>,
+    ) -> Result<Vec<serde_json::Value>, rules_v2::ProfileQueryError> {
+        let profile = self.build_profile_query_v2(request).await?;
+        let query = format!(
+            "{}\nRETURN = events;",
+            profile
+                .query()
+                .map_err(rules_v2::ProfileQueryError::Invalid)?
+        );
+        Ok(self.query(&query, timeperiods).await?)
     }
 
     // TODO: make async

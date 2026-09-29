@@ -2,7 +2,83 @@ use aw_models::Event;
 
 use crate::sort_by_timestamp;
 
-/// Floods event to the nearest neighbouring event if within the specified pulsetime.
+/// Fill short positive heartbeat gaps using the v2 deterministic policy.
+///
+/// Gaps are the uncovered intervals between connected coverage components of
+/// the immutable original records. The left boundary fact has the furthest end
+/// (latest start, then later input on ties), while the right boundary fact has
+/// the earliest start (longest end, then later input on ties). The longer original boundary fact receives the whole
+/// gap as a separate synthetic event and equal durations favor the left.
+/// Original bounds and overlapping originals are retained, so fills never
+/// influence later decisions or overlap precedence.
+pub fn flood_v2(events: Vec<Event>, threshold: chrono::Duration) -> Result<Vec<Event>, String> {
+    if threshold < chrono::Duration::zero() {
+        return Err("flood_v2 threshold_seconds must be a finite non-negative number".to_string());
+    }
+    let originals = sort_by_timestamp(events);
+    if originals.len() < 2 {
+        return Ok(originals);
+    }
+
+    // (coverage start, coverage end, left anchor index, right anchor index).
+    // All indexes refer to immutable originals.
+    let mut components = Vec::new();
+    let mut component_start = originals[0].timestamp;
+    let mut component_end = originals[0].calculate_endtime();
+    let mut left_anchor = 0;
+    let mut right_anchor = 0;
+    for (index, event) in originals.iter().enumerate().skip(1) {
+        let event_end = event.calculate_endtime();
+        if event.timestamp <= component_end {
+            if event.timestamp == component_start
+                && event_end >= originals[right_anchor].calculate_endtime()
+            {
+                right_anchor = index;
+            }
+            if event_end > component_end {
+                component_end = event_end;
+                left_anchor = index;
+            } else if event_end == component_end
+                && event.timestamp >= originals[left_anchor].timestamp
+            {
+                left_anchor = index;
+            }
+            continue;
+        }
+
+        components.push((component_start, component_end, left_anchor, right_anchor));
+        component_start = event.timestamp;
+        component_end = event_end;
+        left_anchor = index;
+        right_anchor = index;
+    }
+    components.push((component_start, component_end, left_anchor, right_anchor));
+
+    let mut flooded = originals.clone();
+    for pair in components.windows(2) {
+        let gap_start = pair[0].1;
+        let gap_end = pair[1].0;
+        let gap = gap_end - gap_start;
+        if gap <= chrono::Duration::zero() || gap > threshold {
+            continue;
+        }
+        let left_index = pair[0].2;
+        let right_index = pair[1].3;
+        let anchor_index = if originals[left_index].duration >= originals[right_index].duration {
+            left_index
+        } else {
+            right_index
+        };
+        let mut synthetic = originals[anchor_index].clone();
+        synthetic.id = None;
+        synthetic.timestamp = gap_start;
+        synthetic.duration = gap;
+        flooded.push(synthetic);
+    }
+    Ok(sort_by_timestamp(flooded))
+}
+
+/// Legacy Query2 transform that floods events to their nearest neighbour.
 ///
 /// Also merges events if they have the same data and are within the pulsetime.
 ///
@@ -171,7 +247,212 @@ mod tests {
 
     use aw_models::Event;
 
-    use super::flood;
+    use super::{flood, flood_v2};
+
+    #[test]
+    fn flood_v2_assigns_gap_to_longer_neighbor_and_ties_left() {
+        let start = DateTime::from_str("2000-01-01T00:00:00Z").unwrap();
+        let old_long = Event {
+            id: None,
+            timestamp: start,
+            duration: Duration::seconds(10),
+            data: json_map! {"name": json!("old")},
+        };
+        let new_short = Event {
+            id: None,
+            timestamp: start + Duration::seconds(14),
+            duration: Duration::seconds(2),
+            data: json_map! {"name": json!("new")},
+        };
+        let result = flood_v2(vec![new_short, old_long], Duration::seconds(5)).unwrap();
+        assert_eq!(result[0].duration, Duration::seconds(10));
+        assert_eq!(result[1].timestamp, start + Duration::seconds(10));
+        assert_eq!(result[1].duration, Duration::seconds(4));
+        assert_eq!(result[1].data["name"], "old");
+        assert_eq!(result[2].timestamp, start + Duration::seconds(14));
+
+        let old_short = Event {
+            id: None,
+            timestamp: start,
+            duration: Duration::seconds(2),
+            data: json_map! {"name": json!("old")},
+        };
+        let new_long = Event {
+            id: None,
+            timestamp: start + Duration::seconds(6),
+            duration: Duration::seconds(10),
+            data: json_map! {"name": json!("new")},
+        };
+        let result = flood_v2(vec![new_long, old_short.clone()], Duration::seconds(5)).unwrap();
+        assert_eq!(result[0].duration, Duration::seconds(2));
+        assert_eq!(result[1].timestamp, start + Duration::seconds(2));
+        assert_eq!(result[1].duration, Duration::seconds(4));
+        assert_eq!(result[1].data["name"], "new");
+        assert_eq!(result[2].timestamp, start + Duration::seconds(6));
+        assert_eq!(result[2].duration, Duration::seconds(10));
+
+        let tied_new = Event {
+            id: None,
+            timestamp: start + Duration::seconds(6),
+            duration: Duration::seconds(2),
+            data: json_map! {"name": json!("new")},
+        };
+        let result = flood_v2(vec![tied_new, old_short], Duration::seconds(5)).unwrap();
+        assert_eq!(result[0].duration, Duration::seconds(2));
+        assert_eq!(result[1].timestamp, start + Duration::seconds(2));
+        assert_eq!(result[1].duration, Duration::seconds(4));
+        assert_eq!(result[1].data["name"], "old");
+        assert_eq!(result[2].timestamp, start + Duration::seconds(6));
+    }
+
+    #[test]
+    fn flood_v2_anchor_exact_ties_prefer_later_input() {
+        let start = DateTime::from_str("2000-01-01T00:00:00Z").unwrap();
+        let event = |id, offset, duration, state| Event {
+            id: Some(id),
+            timestamp: start + Duration::seconds(offset),
+            duration: Duration::seconds(duration),
+            data: json_map! {"state": json!(state)},
+        };
+
+        let left = flood_v2(
+            vec![
+                event(1, 0, 10, "off"),
+                event(2, 0, 10, "on"),
+                event(3, 12, 1, "on"),
+            ],
+            Duration::seconds(5),
+        )
+        .unwrap();
+        let left_gap = left
+            .iter()
+            .find(|event| event.timestamp == start + Duration::seconds(10))
+            .unwrap();
+        assert_eq!(left_gap.duration, Duration::seconds(2));
+        assert_eq!(left_gap.data["state"], "on");
+
+        let right = flood_v2(
+            vec![
+                event(1, 0, 1, "on"),
+                event(2, 3, 10, "off"),
+                event(3, 3, 10, "on"),
+            ],
+            Duration::seconds(5),
+        )
+        .unwrap();
+        let right_gap = right
+            .iter()
+            .find(|event| event.timestamp == start + Duration::seconds(1))
+            .unwrap();
+        assert_eq!(right_gap.duration, Duration::seconds(2));
+        assert_eq!(right_gap.data["state"], "on");
+    }
+
+    #[test]
+    fn flood_v2_retains_overlaps_and_includes_threshold() {
+        let start = DateTime::from_str("2000-01-01T00:00:00Z").unwrap();
+        let old = Event {
+            id: None,
+            timestamp: start,
+            duration: Duration::seconds(10),
+            data: json_map! {"name": json!("same")},
+        };
+        let overlapping = Event {
+            id: None,
+            timestamp: start + Duration::seconds(5),
+            duration: Duration::seconds(2),
+            data: json_map! {"name": json!("same")},
+        };
+        let result =
+            flood_v2(vec![overlapping.clone(), old.clone()], Duration::seconds(5)).unwrap();
+        assert_eq!(result, vec![old.clone(), overlapping]);
+
+        let at_threshold = Event {
+            id: None,
+            timestamp: start + Duration::seconds(15),
+            duration: Duration::seconds(1),
+            data: json_map! {"name": json!("next")},
+        };
+        let result = flood_v2(vec![old, at_threshold], Duration::seconds(5)).unwrap();
+        assert_eq!(result[0].duration, Duration::seconds(10));
+        assert_eq!(result[1].timestamp, start + Duration::seconds(10));
+        assert_eq!(result[1].duration, Duration::seconds(5));
+        assert_eq!(result[2].timestamp, start + Duration::seconds(15));
+    }
+
+    #[test]
+    fn flood_v2_uses_original_durations_for_each_component_gap() {
+        let start = DateTime::from_str("2000-01-01T00:00:00Z").unwrap();
+        let events = vec![
+            Event {
+                id: None,
+                timestamp: start,
+                duration: Duration::seconds(99),
+                data: json_map! {"name": json!("a")},
+            },
+            Event {
+                id: None,
+                timestamp: start + Duration::seconds(104),
+                duration: Duration::seconds(100),
+                data: json_map! {"name": json!("b")},
+            },
+            Event {
+                id: None,
+                timestamp: start + Duration::seconds(205),
+                duration: Duration::milliseconds(100_500),
+                data: json_map! {"name": json!("c")},
+            },
+        ];
+
+        let result = flood_v2(events, Duration::seconds(5)).unwrap();
+
+        assert_eq!(result[0].timestamp, start);
+        assert_eq!(result[0].duration, Duration::seconds(99));
+        assert_eq!(result[1].timestamp, start + Duration::seconds(99));
+        assert_eq!(result[1].duration, Duration::seconds(5));
+        assert_eq!(result[1].data["name"], "b");
+        assert_eq!(result[2].timestamp, start + Duration::seconds(104));
+        assert_eq!(result[2].duration, Duration::seconds(100));
+        assert_eq!(result[3].timestamp, start + Duration::seconds(204));
+        assert_eq!(result[3].duration, Duration::seconds(1));
+        assert_eq!(result[3].data["name"], "c");
+        assert_eq!(result[4].timestamp, start + Duration::seconds(205));
+        assert_eq!(result[4].duration, Duration::milliseconds(100_500));
+    }
+
+    #[test]
+    fn flood_v2_finds_component_boundary_past_nested_records() {
+        let start = DateTime::from_str("2000-01-01T00:00:00Z").unwrap();
+        let events = vec![
+            Event {
+                id: None,
+                timestamp: start,
+                duration: Duration::seconds(1000),
+                data: json_map! {"name": json!("long")},
+            },
+            Event {
+                id: None,
+                timestamp: start + Duration::seconds(10),
+                duration: Duration::seconds(1),
+                data: json_map! {"name": json!("nested")},
+            },
+            Event {
+                id: None,
+                timestamp: start + Duration::seconds(1002),
+                duration: Duration::seconds(1),
+                data: json_map! {"name": json!("right")},
+            },
+        ];
+
+        let result = flood_v2(events.clone(), Duration::seconds(5)).unwrap();
+
+        assert_eq!(result[0], events[0]);
+        assert_eq!(result[1], events[1]);
+        assert_eq!(result[2].timestamp, start + Duration::seconds(1000));
+        assert_eq!(result[2].duration, Duration::seconds(2));
+        assert_eq!(result[2].data["name"], "long");
+        assert_eq!(result[3], events[2]);
+    }
 
     #[test]
     fn test_flood_merge() {

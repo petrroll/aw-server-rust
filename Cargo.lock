@@ -203,6 +203,7 @@ dependencies = [
  "aw-server",
  "chrono",
  "dirs",
+ "fancy-regex",
  "fs4",
  "gethostname",
  "libc",
@@ -275,6 +276,7 @@ dependencies = [
  "chrono",
  "clap",
  "dirs",
+ "fancy-regex",
  "fern",
  "gethostname",
  "jemallocator",
@@ -326,6 +328,7 @@ dependencies = [
  "criterion",
  "fancy-regex",
  "log",
+ "ryu-js",
  "serde",
  "serde_json",
  "url",
@@ -2625,6 +2628,12 @@ name = "ryu"
 version = "1.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "28d3b2b1366ec20994f1fd18c3c594f05c5dd4bc44d8bb0c1c632c8d6829481f"
+
+[[package]]
+name = "ryu-js"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "04d056b875a9d2e6cb9a61d127afee9ac5999b9f87bcb32079d1318e505be714"
 
 [[package]]
 name = "same-file"

@@ -1,6 +1,7 @@
 use aw_models::Event;
 use serde_json::Value;
 
+/// Legacy Query2 field-renaming transform used by explicit old-target queries.
 pub fn map_event_fields(mut events: Vec<Event>, mappings: &Value) -> Result<Vec<Event>, String> {
     let mappings = mappings
         .as_object()

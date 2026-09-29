@@ -18,6 +18,9 @@ macro_rules! json_map {
 
 pub mod classify;
 
+mod fact_resolver;
+mod predicate;
+
 mod classify_v2;
 pub use classify_v2::{
     categorize_v2, categorize_v2_explain, categorize_v2_explain_for_host, categorize_v2_for_host,
@@ -34,7 +37,7 @@ mod find_bucket;
 pub use find_bucket::find_bucket;
 
 mod flood;
-pub use flood::flood;
+pub use flood::{flood, flood_v2};
 
 mod merge;
 pub use merge::merge_events_by_keys;

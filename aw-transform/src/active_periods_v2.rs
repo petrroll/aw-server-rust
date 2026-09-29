@@ -1,29 +1,25 @@
 use std::collections::{HashMap, HashSet};
 
 use aw_models::Event;
-use fancy_regex::Regex;
 use serde_json::Value;
 
 use crate::{
-    classify_v2::{MAX_EXPRESSION_DEPTH, MAX_EXPRESSION_NODES, MAX_REGEX_LENGTH, MAX_RULE_SOURCES},
+    classify_v2::{
+        MAX_EXPRESSION_DEPTH, MAX_EXPRESSION_NODES, MAX_REGEX_LENGTH, MAX_RULE_INTEGER,
+        MAX_RULE_SOURCES, MIN_RULE_INTEGER,
+    },
+    fact_resolver::resolve_fact_slices,
     filter_period_intersect, period_union,
+    predicate::{selected_values, RegexPredicate, ValueMode},
 };
-
-#[derive(Clone, Copy)]
-enum ValueMode {
-    String,
-    Scalar,
-}
 
 enum ActiveExpression {
     None,
     Regex {
         source: String,
         host: Option<String>,
-        regex: Regex,
+        predicate: RegexPredicate,
         fields: Option<Vec<String>>,
-        negate: bool,
-        value_mode: ValueMode,
     },
     All(Vec<ActiveExpression>),
     Any(Vec<ActiveExpression>),
@@ -56,11 +52,12 @@ pub fn active_periods_v2_for_host(
         if !source_ids.insert(source_id.clone()) {
             return Err(format!("duplicate active-time source id: {source_id:?}"));
         }
-        sources.insert(source_id, events);
+        sources.insert(source_id, resolve_fact_slices(&events));
     }
 
-    compile_expression(expression, 1, &mut ExpressionCompileState::default())?
-        .evaluate(&sources, host)
+    let periods = compile_expression(expression, 1, &mut ExpressionCompileState::default())?
+        .evaluate(&sources, host)?;
+    Ok(period_union(&[], &periods))
 }
 
 impl ActiveExpression {
@@ -74,10 +71,8 @@ impl ActiveExpression {
             Self::Regex {
                 source,
                 host: required_host,
-                regex,
+                predicate,
                 fields,
-                negate,
-                value_mode,
             } => {
                 if required_host
                     .as_deref()
@@ -90,27 +85,16 @@ impl ActiveExpression {
                         "active-time expression references unknown source: {source:?}"
                     ));
                 };
-                Ok(events
-                    .iter()
-                    .filter(|event| {
-                        let values = selected_values(event, fields.as_deref())
-                            .into_iter()
-                            .filter_map(|value| normalize_value(value, *value_mode))
-                            .collect::<Vec<_>>();
-                        if values.is_empty() {
-                            return false;
-                        }
-                        let any_match = values
-                            .iter()
-                            .any(|value| regex.is_match(value).unwrap_or(false));
-                        if *negate {
-                            !any_match
-                        } else {
-                            any_match
-                        }
-                    })
-                    .cloned()
-                    .collect())
+                let mut matching = Vec::new();
+                for event in events {
+                    if predicate
+                        .evaluate(selected_values(event, None, fields.as_deref()))?
+                        .matched
+                    {
+                        matching.push(event.clone());
+                    }
+                }
+                Ok(matching)
             }
             Self::All(children) => {
                 let mut children = children.iter();
@@ -239,27 +223,14 @@ fn compile_regex_expression(
         ));
     }
     let ignore_case = parse_bool(spec.get("ignore_case"), false, "ignore_case")?;
-    let regex_source = if ignore_case {
-        format!("(?i){pattern}")
-    } else {
-        pattern.clone()
-    };
-    let regex =
-        Regex::new(&regex_source).map_err(|error| format!("invalid regex {pattern:?}: {error}"))?;
     let negate = parse_bool(spec.get("negate"), false, "negate")?;
-    parse_integer(spec.get("weight"), 0)
-        .map_err(|_| "active-time regex expression 'weight' must be an integer".to_string())?;
-    let value_mode = match spec.get("value_mode") {
-        None => ValueMode::String,
-        Some(Value::String(value)) if value == "string" => ValueMode::String,
-        Some(Value::String(value)) if value == "scalar" => ValueMode::Scalar,
-        _ => {
-            return Err(
-                "active-time regex expression 'value_mode' must be 'string' or 'scalar'"
-                    .to_string(),
-            )
-        }
-    };
+    parse_rule_integer(spec.get("weight"), 0).map_err(|_| {
+        format!(
+            "active-time regex expression 'weight' must be an integer between {MIN_RULE_INTEGER} and {MAX_RULE_INTEGER}"
+        )
+    })?;
+    let value_mode = ValueMode::parse(spec.get("value_mode"), "active-time regex expression")?;
+    let predicate = RegexPredicate::compile(pattern, ignore_case, negate, value_mode)?;
     let fields_value = if spec.contains_key("fields") {
         spec.get("fields")
     } else if spec.contains_key("field") {
@@ -293,10 +264,8 @@ fn compile_regex_expression(
     Ok(ActiveExpression::Regex {
         source,
         host,
-        regex,
+        predicate,
         fields,
-        negate,
-        value_mode,
     })
 }
 
@@ -323,51 +292,19 @@ fn parse_bool(value: Option<&Value>, default: bool, field: &str) -> Result<bool,
     }
 }
 
-fn parse_integer(value: Option<&Value>, default: i64) -> Result<i64, ()> {
+fn parse_rule_integer(value: Option<&Value>, default: i64) -> Result<i64, ()> {
     match value {
         None => Ok(default),
         Some(Value::Number(value)) => value
             .as_i64()
             .or_else(|| {
                 value.as_f64().and_then(|value| {
-                    (value.is_finite()
-                        && value.fract() == 0.0
-                        && value >= i64::MIN as f64
-                        && value <= i64::MAX as f64)
-                        .then_some(value as i64)
+                    (value.is_finite() && value.fract() == 0.0).then_some(value as i64)
                 })
             })
+            .filter(|value| (MIN_RULE_INTEGER..=MAX_RULE_INTEGER).contains(value))
             .ok_or(()),
         _ => Err(()),
-    }
-}
-
-fn selected_values<'a>(event: &'a Event, fields: Option<&[String]>) -> Vec<&'a Value> {
-    if let Some(fields) = fields {
-        return fields
-            .iter()
-            .filter_map(|field| event.data.get(field))
-            .collect();
-    }
-    event
-        .data
-        .iter()
-        .filter(|(key, _)| {
-            !matches!(
-                key.as_str(),
-                "$category" | "$category_score" | "$category_rule" | "$category_explain" | "$host"
-            ) && !key.starts_with("$source.")
-        })
-        .map(|(_, value)| value)
-        .collect()
-}
-
-fn normalize_value(value: &Value, value_mode: ValueMode) -> Option<String> {
-    match (value_mode, value) {
-        (_, Value::String(value)) => Some(value.clone()),
-        (ValueMode::Scalar, Value::Bool(value)) => Some(value.to_string()),
-        (ValueMode::Scalar, Value::Number(value)) => Some(value.to_string()),
-        _ => None,
     }
 }
 
@@ -416,6 +353,22 @@ mod tests {
             DateTime::<Utc>::from_str("2025-01-01T00:00:05Z").unwrap()
         );
         assert_eq!(result[0].duration, Duration::seconds(5));
+    }
+
+    #[test]
+    fn adjacent_matching_fact_slices_are_one_period() {
+        let first = event("2025-01-01T00:00:00Z", 4, json!({"state": "active"}));
+        let second = event("2025-01-01T00:00:04Z", 3, json!({"state": "active"}));
+        let expression = json!({
+            "type": "regex", "source": "afk", "field": "state", "regex": "^active$"
+        });
+
+        let result =
+            active_periods_v2(vec![("afk".to_string(), vec![first, second])], &expression).unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].duration, Duration::seconds(7));
+        assert!(result[0].data.is_empty());
     }
 
     #[test]
@@ -485,14 +438,145 @@ mod tests {
     }
 
     #[test]
-    fn rejects_nonintegral_weight() {
-        let expression =
-            json!({"regex": "active", "source": "afk", "field": "state", "weight": 1.5});
-        assert!(
-            active_periods_v2(vec![("afk".to_string(), vec![])], &expression)
-                .unwrap_err()
-                .contains("weight")
+    fn predicates_evaluate_the_winning_fact_slices() {
+        let source = vec![
+            event("2025-01-01T00:00:00Z", 30, json!({"state": "on"})),
+            event("2025-01-01T00:00:10Z", 10, json!({"state": "off"})),
+        ];
+        let on = json!({
+            "type": "regex", "source": "switch", "field": "state", "regex": "^on$"
+        });
+        let contradiction = json!({
+            "type": "all",
+            "rules": [
+                {"type": "regex", "source": "switch", "field": "state", "regex": "^on$"},
+                {"type": "regex", "source": "switch", "field": "state", "regex": "^off$"}
+            ]
+        });
+
+        let periods = active_periods_v2(vec![("switch".to_string(), source.clone())], &on).unwrap();
+        assert_eq!(
+            periods
+                .iter()
+                .map(|event| (event.timestamp.to_rfc3339(), event.duration.num_seconds()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("2025-01-01T00:00:00+00:00".to_string(), 10),
+                ("2025-01-01T00:00:20+00:00".to_string(), 10),
+            ]
         );
+        assert!(
+            active_periods_v2(vec![("switch".to_string(), source.clone())], &contradiction,)
+                .unwrap()
+                .is_empty()
+        );
+
+        let coverage = vec![event("2025-01-01T00:00:00Z", 30, json!({"coverage": true}))];
+        let enriched = crate::merge_subwatcher_fields(
+            coverage,
+            source,
+            &["state".to_string()],
+            "base_wins",
+            Some("switch"),
+        )
+        .unwrap();
+        let categorized = crate::categorize_v2(
+            enriched,
+            &json!([{
+                "name": ["On"],
+                "rule": {
+                    "type": "regex", "source": "switch", "field": "state", "regex": "^on$"
+                }
+            }]),
+        )
+        .unwrap();
+        assert_eq!(
+            categorized
+                .iter()
+                .map(|event| (
+                    event.duration.num_seconds(),
+                    event.data["$category"].clone()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (10, json!(["On"])),
+                (10, json!(["Uncategorized"])),
+                (10, json!(["On"])),
+            ]
+        );
+    }
+
+    #[test]
+    fn scalar_predicates_use_ecmascript_spelling() {
+        let cases = [
+            (json!(1e-7), "^1e-7$"),
+            (json!(1e-6), "^0\\.000001$"),
+            (json!(1.5), "^1\\.5$"),
+            (json!(1.0), "^1$"),
+            (json!(-0.0), "^0$"),
+            (json!(0.1), "^0\\.1$"),
+            (json!(1e20), "^100000000000000000000$"),
+            (json!(1e21), "^1e\\+21$"),
+            (json!(123.456e5), "^12345600$"),
+            (json!(1_000_000_000_000_000.2), "^1000000000000000\\.2$"),
+            (json!(1_551_040_077_889.2812), "^1551040077889\\.2812$"),
+            (json!(true), "^true$"),
+            (json!(9_007_199_254_740_993_i64), "^9007199254740993$"),
+        ];
+        for (value, regex) in cases {
+            let expression = json!({
+                "type": "regex", "source": "values", "field": "value",
+                "regex": regex, "value_mode": "scalar"
+            });
+            assert_eq!(
+                active_periods_v2(
+                    vec![(
+                        "values".to_string(),
+                        vec![event("2025-01-01T00:00:00Z", 1, json!({"value": value}),)]
+                    )],
+                    &expression,
+                )
+                .unwrap()
+                .len(),
+                1,
+                "value {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn regex_runtime_failures_are_errors_even_when_negated() {
+        let expression = json!({
+            "type": "regex", "source": "values", "field": "value",
+            "regex": "^(a+)+(?=b)$|^a+!$", "negate": true
+        });
+        let error = active_periods_v2(
+            vec![(
+                "values".to_string(),
+                vec![event(
+                    "2025-01-01T00:00:00Z",
+                    1,
+                    json!({"value": format!("{}!", "a".repeat(30))}),
+                )],
+            )],
+            &expression,
+        )
+        .unwrap_err();
+        assert!(error.contains("regex execution failed"), "{error}");
+    }
+
+    #[test]
+    fn rejects_nonintegral_and_out_of_range_weight() {
+        for weight in [json!(1.5), json!(1_000_001), json!(-1_000_001), json!(true)] {
+            let expression = json!({
+                "regex": "active", "source": "afk", "field": "state", "weight": weight
+            });
+            assert!(
+                active_periods_v2(vec![("afk".to_string(), vec![])], &expression)
+                    .unwrap_err()
+                    .contains("weight")
+            );
+        }
     }
 
     #[test]
